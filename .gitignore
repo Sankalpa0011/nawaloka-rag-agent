@@ -1,0 +1,41 @@
+# --- Secrets -----------------------------------------------------------------
+.env
+.env.local
+*.key
+
+# --- Python ------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Node / Next.js ----------------------------------------------------------
+node_modules/
+.next/
+out/
+frontend/.env*.local
+
+# --- Data --------------------------------------------------------------------
+# data/raw/ is deliberately COMMITTED: it is the cached rendered HTML that lets
+# the whole vector index be rebuilt offline, with no network access and no
+# dependence on the live site still looking the same. See app/ingest/scrape.py.
+backend/data/extracted/
+backend/data/chunks/
+backend/.embeddings_cache/
+backend/evals/.llm_cache/
+
+# --- Local tooling -----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+".env" 
+"__pycache__/" 
+".venv/" 
+"node_modules/" 
+".DS_Store" 

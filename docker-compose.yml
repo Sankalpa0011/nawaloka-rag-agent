@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nawaloka-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nawaloka}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nawaloka_dev_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-nawaloka}
+      # Consumed by 004_ro_role.sql via psql variable substitution.
+      CHATBOT_RO_PASSWORD: ${CHATBOT_RO_PASSWORD:-chatbot_ro_dev_pw}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Scripts run once, in lexical order, on first initialisation of an empty volume.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nawaloka} -d ${POSTGRES_DB:-nawaloka}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: nawaloka-qdrant
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+    healthcheck:
+      # The qdrant image is distroless - no curl/wget - so probe from the bundled binary instead.
+      test: ["CMD", "/qdrant/qdrant", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  qdrantdata:
