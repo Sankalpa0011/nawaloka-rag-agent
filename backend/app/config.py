@@ -32,15 +32,30 @@ class Settings(BaseSettings):
     # --- LLM providers -------------------------------------------------------
     gemini_api_key: str = ""
     groq_api_key: str = ""
-    llm_provider_order: str = "gemini,groq"
+    # Groq first: ~0.3 s versus Gemini's ~3 s on the same prompt. Gemini is the
+    # overflow provider - its 250k TPM absorbs load once Groq's 6k TPM budget
+    # for the minute is spent, which is exactly when failover should happen.
+    llm_provider_order: str = "groq,gemini"
 
-    llm_fast_model_gemini: str = "gemini-2.5-flash-lite"
-    llm_strong_model_gemini: str = "gemini-2.5-flash"
+    # Newly-created AI Studio accounts cannot call the gemini-2.x family at all:
+    # 2.5 returns 404 "no longer available to new users" and 2.0 returns 429.
+    # The 3.x flash family is what such accounts actually get.
+    # `python -m app.llm.check_models` re-derives this against the live key.
+    llm_fast_model_gemini: str = "gemini-3.1-flash-lite"
+    # gemini-3.6-flash reasons at length and took 45s+ on a one-line prompt;
+    # 3.5-flash answers the same prompt in ~2s.
+    llm_strong_model_gemini: str = "gemini-3.5-flash"
     llm_fast_model_groq: str = "llama-3.1-8b-instant"
     llm_strong_model_groq: str = "llama-3.3-70b-versatile"
 
-    gemini_rpm: int = 12
-    groq_rpm: int = 28
+    # Requests per minute, used to seed the client-side buckets.
+    gemini_rpm: int = 15
+    groq_rpm: int = 25
+    # Tokens per minute. This, not RPM, is the binding free-tier constraint:
+    # Groq allows 6,000 TPM on llama-3.1-8b-instant, so a 1,400-token prompt
+    # caps throughput at ~4 requests/minute regardless of the RPM headroom.
+    gemini_tpm: int = 250_000
+    groq_tpm: int = 6_000
 
     # --- Postgres ------------------------------------------------------------
     database_url: str = "postgresql://nawaloka:nawaloka_dev_pw@localhost:5433/nawaloka"
