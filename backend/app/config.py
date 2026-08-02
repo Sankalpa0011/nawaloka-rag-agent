@@ -59,9 +59,19 @@ class Settings(BaseSettings):
     sparse_model: str = "Qdrant/bm25"
     rerank_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
     retrieval_prefetch_limit: int = 30
-    retrieval_fusion_limit: int = 20
+    # Candidates handed to the cross-encoder. Reranking is the dominant cost in
+    # a retrieval call and scales linearly with this number; 12 is well clear of
+    # the top_k=5 that survives the score floor in practice.
+    retrieval_fusion_limit: int = 12
+    # 0 = auto (cpu_count - 1).
+    onnx_threads: int = 0
     retrieval_top_k: int = 5
-    retrieval_score_floor: float = 0.15
+    # Calibrated, not guessed - see docs/retrieval-calibration.md. Sigmoid of
+    # the cross-encoder logit. At 0.02 in-scope queries keep 2-10 chunks while
+    # every out-of-scope query keeps zero, which is what drives abstention.
+    # A *relative* floor (ratio x top score) was measured and rejected: when
+    # the top score is 0.000 it admits the entire candidate set.
+    retrieval_score_floor: float = 0.02
 
     # --- Scraper -------------------------------------------------------------
     scrape_sitemap_url: str = "https://www.nawaloka.com/sitemap.xml"
