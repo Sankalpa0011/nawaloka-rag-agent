@@ -54,7 +54,9 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        # Healthy, not merely started: the API seeds the vector store during
+        # startup and would otherwise race Qdrant's own boot.
+        condition: service_healthy
     environment:
       # Inside the compose network the services are reachable by name, and
       # Postgres listens on 5432 regardless of the host port mapping.
@@ -66,6 +68,9 @@ services:
       LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-groq,gemini}
       CORS_ORIGINS: http://localhost:3000
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Builds the vector index from the committed HTML cache on first start.
+      # Set to false if you would rather seed manually.
+      SEED_ON_STARTUP: ${SEED_ON_STARTUP:-true}
     ports:
       - "${BACKEND_PORT:-8001}:8001"
     restart: unless-stopped
@@ -78,7 +83,10 @@ services:
         NEXT_PUBLIC_API_URL: http://localhost:${BACKEND_PORT:-8001}
     container_name: nawaloka-frontend
     depends_on:
-      - backend
+      backend:
+        # Waits out the first-boot index build, so the UI never loads against
+        # an API that is not ready to answer.
+        condition: service_healthy
     ports:
       - "3000:3000"
     restart: unless-stopped

@@ -48,9 +48,21 @@ log = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log.info("api.starting")
+
+    # Postgres seeds itself from db/init, but Qdrant comes up empty, so build
+    # the index here on first boot - that keeps `docker compose up` the only
+    # command anyone needs. Idempotent: a restart costs one count query.
+    # Deliberately not fatal; a degraded /health beats an API that won't start.
+    try:
+        from app.ingest.ensure_seeded import ensure_seeded
+
+        await asyncio.to_thread(ensure_seeded)
+    except Exception as exc:
+        log.warning("api.seed_failed", error=str(exc)[:200])
+
     # Warm the ONNX models and compile the graph so the first real request is
     # not paying a ~5 s cold start.
-    log.info("api.starting")
     try:
         from app.retrieval.embedder import warm_up
 

@@ -36,7 +36,11 @@ TextCrossEncoder('Xenova/ms-marco-MiniLM-L-6-v2')"
 
 EXPOSE 8001
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+# start-period is generous: the first boot builds the vector index from the
+# cached HTML (~60 s) in the startup lifespan, before uvicorn binds the port.
+HEALTHCHECK --interval=15s --timeout=10s --start-period=180s --retries=5 \
     CMD curl -fsS http://localhost:8001/health || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+# app.main's __main__ calls uvicorn.run() with the configured port, so there is
+# no shell needed to expand BACKEND_PORT.
+CMD ["python", "-m", "app.main"]
