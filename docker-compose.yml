@@ -37,6 +37,52 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # Application services sit behind the "app" profile, so the default
+  # `docker compose up -d` still brings up only Postgres and Qdrant - which is
+  # what you want while developing against a locally-run backend.
+  #
+  #   docker compose up -d                      infrastructure only
+  #   docker compose --profile app up -d        the whole stack
+  # ---------------------------------------------------------------------------
+  backend:
+    profiles: ["app"]
+    build:
+      context: ./backend
+    container_name: nawaloka-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    environment:
+      # Inside the compose network the services are reachable by name, and
+      # Postgres listens on 5432 regardless of the host port mapping.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-nawaloka}:${POSTGRES_PASSWORD:-nawaloka_dev_pw}@postgres:5432/${POSTGRES_DB:-nawaloka}
+      DATABASE_RO_URL: postgresql://chatbot_ro:${CHATBOT_RO_PASSWORD:-chatbot_ro_dev_pw}@postgres:5432/${POSTGRES_DB:-nawaloka}
+      QDRANT_URL: http://qdrant:6333
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-groq,gemini}
+      CORS_ORIGINS: http://localhost:3000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${BACKEND_PORT:-8001}:8001"
+    restart: unless-stopped
+
+  frontend:
+    profiles: ["app"]
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:${BACKEND_PORT:-8001}
+    container_name: nawaloka-frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
 volumes:
   pgdata:
   qdrantdata:

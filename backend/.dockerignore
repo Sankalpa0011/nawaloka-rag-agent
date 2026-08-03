@@ -1,0 +1,13 @@
+# Without this the ~1 GB virtualenv is uploaded into the build context.
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+data/extracted
+data/chunks
+evals/.llm_cache
+Dockerfile
+.dockerignore
