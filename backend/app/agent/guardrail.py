@@ -29,6 +29,9 @@ GuardrailVerdict = Literal["EMERGENCY", "REFUSE", "SYMPTOM", "CLEAR"]
 
 AMBULANCE = "1990 Suwa Seriya"
 HOSPITAL_EMERGENCY = "0115 777 777"
+#: Nawaloka's own emergency ambulance, taken from the scraped
+#: /quick-service-contacts page rather than assumed.
+ETU_AMBULANCE = "077 951 1929"
 
 # --------------------------------------------------------------------------
 # Emergency. Patterns are intentionally specific: "chest pain" alone is a
@@ -157,7 +160,8 @@ class GuardrailResult:
 EMERGENCY_RESPONSE = f"""**This may be a medical emergency. Please get help now.**
 
 - **Ambulance: {AMBULANCE}** — free nationwide emergency ambulance service
-- **Nawaloka Hospital emergency: {HOSPITAL_EMERGENCY}**
+- **Nawaloka ETU ambulance: {ETU_AMBULANCE}**
+- **Nawaloka Hospital: {HOSPITAL_EMERGENCY}**
 - Or go to your nearest emergency department immediately
 
 Nawaloka Hospitals' Accident & Emergency unit operates 24 hours.

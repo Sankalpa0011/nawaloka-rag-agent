@@ -62,6 +62,12 @@ class AgentState(TypedDict, total=False):
     documents: list[dict]
     retrieval: dict
 
+    # --- memory -----------------------------------------------------------
+    memory: dict
+
+    # --- FAQ / cache ------------------------------------------------------
+    cache: dict
+
     # --- output -----------------------------------------------------------
     answer: str
     citations: list[dict]

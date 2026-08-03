@@ -25,12 +25,18 @@ import time
 from langgraph.graph import END, StateGraph
 
 from app.agent import guardrail
+from app.agent.nodes.contextualize import contextualize_node
+from app.agent.nodes.faq import cache_write, faq_node
 from app.agent.nodes.retrieve import retrieve_node
 from app.agent.nodes.sql_agent import sql_agent_node
 from app.agent.nodes.synthesize import synthesize_node
 from app.agent.router import route_query
+from app.agent.signals import extract_signals
 from app.agent.state import AgentState, new_state, trace_event
+from app.config import settings
 from app.logging_conf import get_logger
+from app.memory import store
+from app.memory.summarizer import should_summarise, summarise
 
 log = get_logger(__name__)
 
@@ -62,12 +68,19 @@ async def ingest_node(state: AgentState) -> dict:
 
 async def guardrail_node(state: AgentState) -> dict:
     verdict = guardrail.check(state.get("contextual_query") or state["user_query"])
-    return {
+    out: dict = {
         "guardrail": verdict.to_dict(),
         "disclaimer_required": verdict.disclaimer_required,
         "trace": [trace_event("guardrail", verdict=verdict.verdict,
                               reason=verdict.reason)],
     }
+    # An intercepted turn never reaches the classifier, so the route has to be
+    # set here. Without this `route` stays unset and direct_answer falls
+    # through to its final branch - which answered medical emergencies with the
+    # "I only handle hospital questions" message.
+    if verdict.short_circuits:
+        out["route"] = verdict.verdict
+    return out
 
 
 async def route_node(state: AgentState) -> dict:
@@ -114,8 +127,69 @@ async def direct_answer_node(state: AgentState) -> dict:
 
 
 async def finalize_node(state: AgentState) -> dict:
-    return {"trace": [trace_event("finalize", route=state.get("route"),
-                                  citations=len(state.get("citations") or []))]}
+    # Cache writes happen here, after the answer has passed every check, so
+    # only fully validated responses are ever reused.
+    cached = cache_write(state)
+    memory_saved = await _persist_memory(state)
+    return {
+        "trace": [
+            trace_event("finalize", route=state.get("route"), cached=cached,
+                        memory=memory_saved,
+                        citations=len(state.get("citations") or []))
+        ]
+    }
+
+
+async def _persist_memory(state: AgentState) -> bool:
+    """Record the turn and roll the focus slots forward.
+
+    Memory failures never fail a turn - the answer has already been produced,
+    and losing a thread's continuity is a far smaller problem than losing the
+    reply.
+    """
+    if not settings.enable_memory:
+        return False
+
+    thread_id = state.get("thread_id", "default")
+    answer_text = state.get("answer") or ""
+    if not answer_text.strip():
+        return False
+
+    try:
+        store.append_turn(thread_id, state["user_query"], answer_text,
+                          route=state.get("route", ""))
+
+        thread = store.get_state(thread_id)
+        thread.turn_count += 1
+
+        # Roll focus slots forward from whatever this turn mentioned.
+        signals = extract_signals(state.get("contextual_query") or state["user_query"])
+        thread.focus_entities = store.update_focus(thread.focus_entities, signals.entities)
+
+        if should_summarise(thread):
+            history = store.get_history(thread_id, limit=10)
+            summary = await summarise(history, thread.summary)
+            if summary:
+                thread.summary = summary
+
+        store.save_state(thread)
+        return True
+    except Exception as exc:
+        log.warning("finalize.memory_failed", error=str(exc)[:160])
+        return False
+
+
+def _after_guardrail(state: AgentState) -> str:
+    """Emergencies and refusals skip the FAQ entirely - they are already decided."""
+    verdict = (state.get("guardrail") or {}).get("verdict")
+    if verdict in ("EMERGENCY", "REFUSE"):
+        return "direct_answer"
+    return "faq"
+
+
+def _after_faq(state: AgentState) -> str:
+    """A cache hit is already an answer; skip routing, retrieval and synthesis."""
+    return "finalize" if state.get("route") == "FAQ" else "classify"
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +209,9 @@ def build_graph():
     g = StateGraph(AgentState)
 
     g.add_node("ingest", ingest_node)
+    g.add_node("contextualize", contextualize_node)
     g.add_node("check_safety", guardrail_node)
+    g.add_node("faq", faq_node)
     g.add_node("classify", route_node)
     g.add_node("sql_agent", sql_agent_node)
     g.add_node("retrieve", retrieve_node)
@@ -144,8 +220,19 @@ def build_graph():
     g.add_node("finalize", finalize_node)
 
     g.set_entry_point("ingest")
-    g.add_edge("ingest", "check_safety")
-    g.add_edge("check_safety", "classify")
+    g.add_edge("ingest", "contextualize")
+    g.add_edge("contextualize", "check_safety")
+
+    # The FAQ sits after the guardrail (so an emergency is never answered from
+    # a cache) and before routing (so a hit costs no LLM call at all).
+    g.add_conditional_edges(
+        "check_safety",
+        _after_guardrail,
+        {"faq": "faq", "direct_answer": "direct_answer"},
+    )
+    g.add_conditional_edges(
+        "faq", _after_faq, {"classify": "classify", "finalize": "finalize"}
+    )
 
     g.add_conditional_edges(
         "classify",
