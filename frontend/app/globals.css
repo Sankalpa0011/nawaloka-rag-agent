@@ -105,15 +105,62 @@ header p {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px 13px;
-  white-space: pre-wrap;
-  word-wrap: break-word;
+  overflow-wrap: anywhere;
 }
 
-.bubble p:first-child {
+/* The user's own text is shown verbatim, so newlines must survive. Assistant
+   answers go through the markdown renderer and produce real block elements,
+   which must NOT also get pre-wrap or every gap doubles. */
+.msg.user .bubble {
+  white-space: pre-wrap;
+}
+
+/* --- rendered markdown -------------------------------------------------- */
+.md > *:first-child {
   margin-top: 0;
 }
-.bubble p:last-child {
+
+.md > *:last-child {
   margin-bottom: 0;
+}
+
+.md p {
+  margin: 0 0 10px;
+}
+
+.md ul,
+.md ol {
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+
+.md li {
+  margin-bottom: 4px;
+}
+
+.md li:last-child {
+  margin-bottom: 0;
+}
+
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 14px;
+  margin: 14px 0 6px;
+}
+
+.md strong {
+  font-weight: 600;
+}
+
+.md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  background: #f2f4f5;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 4px;
 }
 
 .empty {

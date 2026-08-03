@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { checkHealth, streamChat, type AgentEvent, type Citation } from "@/lib/api";
+import { Markdown } from "@/lib/markdown";
 
 // Everything the trace panel shows for one answer. Collected from the SSE
 // events as they arrive, so the panel reflects what actually happened rather
@@ -183,7 +184,13 @@ export default function Page() {
         {messages.map((m, i) => (
           <div key={i} className={`msg ${m.role}`}>
             <div className="who">{m.role === "user" ? "You" : "Assistant"}</div>
-            <div className="bubble">{m.text || "…"}</div>
+            <div className="bubble">
+              {m.role === "assistant" ? (
+                m.text ? <Markdown text={m.text} /> : "…"
+              ) : (
+                m.text
+              )}
+            </div>
             {m.role === "assistant" && m.details && (
               <MessageMeta message={m} />
             )}

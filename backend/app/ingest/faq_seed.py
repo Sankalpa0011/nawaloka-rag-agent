@@ -177,10 +177,36 @@ FAQS: list[FaqEntry] = [
         tags=["international"],
     ),
     FaqEntry(
+        id="faq-about-hospital",
+        question="Tell me about Nawaloka Hospitals",
+        paraphrases=[
+            "do you know nawaloka hospitals", "what is nawaloka hospital",
+            "about the hospital", "who are nawaloka", "nawaloka hospitals",
+            "tell me about this hospital", "what kind of hospital is this",
+        ],
+        answer=(
+            "Nawaloka Hospitals PLC is a private multi-specialty hospital in "
+            "Colombo, Sri Lanka, offering both inpatient and outpatient care.\n\n"
+            "Our centres of excellence include the Heart Centre, Neuro Centre, "
+            "Cancer & Blood Disease Centre, Bone Marrow Transplant Unit, "
+            "Fertility Centre, Mother & Baby unit, Radiology & Imaging and a "
+            "24-hour Accident & Emergency unit.\n\n"
+            "Ask me about a specific centre, a consultant's fee, channeling "
+            "times, a lab test price, or a health check package."
+        ),
+        source_urls=["https://www.nawaloka.com/aboutus"],
+        tags=["about"],
+    ),
+    FaqEntry(
         id="faq-what-can-you-do",
         question="What can you help me with?",
         paraphrases=[
             "what do you do", "who are you", "how can you help", "your capabilities",
+            # Greetings are indexed here so an opening "hi" gets the capability
+            # list instantly instead of taking the slow SMALLTALK route to the
+            # same answer. Very short strings embed weakly, so several are
+            # listed rather than relying on one to generalise.
+            "hi", "hello", "hey", "good morning", "good afternoon", "start",
         ],
         answer=(
             "I can help you with:\n\n"
