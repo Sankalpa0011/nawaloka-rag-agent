@@ -108,7 +108,7 @@ class Settings(BaseSettings):
 
     # --- App -----------------------------------------------------------------
     log_level: str = "INFO"
-    backend_port: int = 8000
+    backend_port: int = 8001
     cors_origins: str = "http://localhost:3000"
 
     @field_validator("llm_provider_order")

@@ -23,6 +23,9 @@ GREEN, RED, YELLOW, DIM, BOLD, RESET = (
 )
 
 # (question, expected_route, must_contain, why_it_matters)
+# expected_route may list several acceptable routes separated by "|" - some
+# questions are correctly answerable by more than one path (e.g. the curated
+# FAQ and retrieval both give a right answer for "do you have a blood bank").
 CASES: list[tuple[str, str, list[str], str]] = [
     (
         "What is Dr. Maiya Gunasekara's consultation fee?",
@@ -66,8 +69,13 @@ CASES: list[tuple[str, str, list[str], str]] = [
     ),
     (
         "Do you have a blood bank?",
-        "VECTOR", ["blood"],
-        "service availability, website only",
+        "VECTOR|FAQ", ["blood"],
+        "either path is correct - the curated FAQ answers this one instantly",
+    ),
+    (
+        "What is the ambulance number?",
+        "FAQ", ["1990"],
+        "FAST PATH: curated FAQ, no LLM call",
     ),
     (
         "What does the diabetes centre do, and how much is a consultation?",
@@ -96,7 +104,7 @@ CASES: list[tuple[str, str, list[str], str]] = [
     ),
     (
         "Hello",
-        "SMALLTALK", [],
+        "SMALLTALK|FAQ", [],
         "greeting answered without retrieval or SQL",
     ),
 ]
@@ -125,7 +133,8 @@ async def main() -> int:
         route = state.get("route", "")
         text = state.get("answer", "")
 
-        route_ok = route == expected_route
+        acceptable = set(expected_route.split("|"))
+        route_ok = route in acceptable
         missing = [m for m in must_contain if m.lower() not in text.lower()]
         ok = route_ok and not missing
         passed, failed = (passed + 1, failed) if ok else (passed, failed + 1)
