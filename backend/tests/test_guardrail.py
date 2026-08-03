@@ -74,6 +74,13 @@ class TestRefusal:
         ("I have a headache and fever, what disease do I have?", "diagnosis"),
         ("what's wrong with me?", "diagnosis"),
         ("do I have diabetes?", "diagnosis"),
+        # Third-person / hypothetical phrasings ask for the same thing. The
+        # rewriter was observed turning "if someone had my symptoms, what
+        # would they have?" into "what are the possible diagnoses for chest
+        # pain", which the first-person patterns did not catch.
+        ("what are the possible diagnoses for chest pain?", "diagnosis"),
+        ("what condition would cause fever and a rash?", "diagnosis"),
+        ("what causes my headaches?", "diagnosis"),
         ("what dosage of amoxicillin should I take?", "prescription"),
         ("how many mg of paracetamol for a child", "prescription"),
         ("my blood test shows TSH of 8.2 - is that bad?", "result interpretation"),

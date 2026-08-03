@@ -66,7 +66,14 @@ REFUSE_PATTERNS: tuple[tuple[str, str, str], ...] = (
         r"\bwhat\s+(disease|illness|condition)\s+do\s+i\s+have\b"
         r"|\bwhat'?s\s+wrong\s+with\s+me\b"
         r"|\bdo\s+i\s+have\s+(cancer|diabetes|covid|a\s+tumou?r)\b"
-        r"|\bdiagnos(e|is)\s+me\b",
+        r"|\bdiagnos(e|is)\s+me\b"
+        # Third-person and hypothetical phrasings ask for the same thing.
+        # Caught after a rewrite turned "if someone had my symptoms, what
+        # would they have?" into "what are the possible diagnoses for chest
+        # pain" - which the first-person patterns above do not match.
+        r"|\b(possible|likely|differential)\s+diagnos(is|es)\b"
+        r"|\bwhat\s+(disease|illness|condition)s?\s+(would|could|might|does)\b"
+        r"|\bwhat\s+causes?\s+(my|these|those)\s+\w+",
         "diagnosis",
         "I can't diagnose conditions.",
     ),
