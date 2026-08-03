@@ -116,10 +116,32 @@ class TestSymptomContext:
         assert result.disclaimer_required
 
     @pytest.mark.parametrize("query", [
+        "my brother got cold who needs to contact?",
+        "my child has flu, who should we see?",
+        "I have a bad headache",
+        "numbness in my arm",
+        "I sprained my ankle",
+        "allergic reaction, which clinic?",
+    ])
+    def test_everyday_illnesses_are_flagged(self, query: str):
+        """Regression: these were missing, and the gap was not cosmetic.
+
+        A question the guardrail calls CLEAR reaches the FAQ fast path, so
+        "my brother got cold who needs to contact?" was answered with the
+        ambulance number - wrong, and alarming for a common cold.
+        """
+        assert check(query).verdict == "SYMPTOM"
+
+    @pytest.mark.parametrize("query", [
         "what are your visiting hours?",
         "how much is a cardiology consultation?",
         "where is the hospital located?",
         "which doctors work on Tuesday?",
+        # "numb" is prefix-matched, so a careless pattern claims "number" and
+        # puts a medical disclaimer on every request for a phone number.
+        "what is the ambulance number",
+        "what is the hospital phone number",
+        "which room number is Dr. Pathirana in?",
     ])
     def test_ordinary_questions_are_clear(self, query: str):
         result = check(query)

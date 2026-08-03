@@ -60,6 +60,19 @@ MAX_ATTEMPTS_PER_PROVIDER = 2
 # Beyond this, failing over is faster than queueing.
 FAILOVER_WAIT_SECONDS = 1.5
 
+# Output tokens to reserve against the budget, regardless of how high the
+# caller sets ``max_tokens``.
+#
+# ``max_tokens`` is a *safety ceiling*, not a prediction - synthesis sets 2500
+# purely so Gemini's thinking tokens cannot truncate the visible answer.
+# Charging that ceiling to the budget made a full-directory synthesis estimate
+# 5,045 tokens against Groq's 6,000/min, so it was declared throttled and
+# handed to Gemini, which was 503-ing under load: 52 seconds for an answer Groq
+# produces in under one. The turn that actually ran reported 2,125 tokens
+# total. Reserving a realistic figure and letting ``reconcile`` correct it from
+# the provider's own usage numbers is both more accurate and self-healing.
+OUTPUT_RESERVE_TOKENS = 700
+
 
 class LLMRouter:
     def __init__(self) -> None:
@@ -68,10 +81,21 @@ class LLMRouter:
             "groq": GroqProvider(),
         }
         rpm = {"gemini": settings.gemini_rpm, "groq": settings.groq_rpm}
-        tpm = {"gemini": settings.gemini_tpm, "groq": settings.groq_tpm}
+
+        # Token allowances are published per *model*, not per provider, and the
+        # two tiers differ by 2x on Groq (6k for llama-3.1-8b-instant, 12k for
+        # llama-3.3-70b-versatile). Pacing both against the smaller figure
+        # throttles synthesis at half its real allowance.
+        self._tpm: dict[tuple[str, str], int] = {
+            ("gemini", "fast"): settings.gemini_tpm,
+            ("gemini", "strong"): settings.gemini_tpm_strong,
+            ("groq", "fast"): settings.groq_tpm,
+            ("groq", "strong"): settings.groq_tpm_strong,
+        }
 
         self.providers: list[Provider] = []
         self.buckets: dict[str, AsyncTokenBucket] = {}
+        #: Keyed by ``provider:model``, created lazily by :meth:`_budget`.
         self.budgets: dict[str, TokenBudget] = {}
         self.breakers: dict[str, CircuitBreaker] = {}
         self.disabled: dict[str, str] = {}
@@ -86,8 +110,9 @@ class LLMRouter:
                 continue
             self.providers.append(provider)
             self.buckets[name] = AsyncTokenBucket(rpm.get(name, 15), name=name)
-            self.budgets[name] = TokenBudget(tpm.get(name, 30_000), name=name)
             self.breakers[name] = CircuitBreaker(name=name)
+            for tier in ("fast", "strong"):
+                self._budget(name, provider.model_for(tier), tier=tier)
 
         if not self.providers:
             log.error("llm.no_providers_configured")
@@ -101,6 +126,26 @@ class LLMRouter:
             log.warning("llm.suspicious_gemini_key", detail=warning)
 
     # ------------------------------------------------------------------
+    def _budget(self, provider: str, model: str, tier: str | None = None) -> TokenBudget:
+        """Token budget for one provider/model pair, created on first use.
+
+        ``tier`` is only needed to look up the configured allowance; once the
+        budget exists it is found by model name alone, so a caller that knows
+        just the model it is about to hit does not have to know its tier.
+        """
+        key = f"{provider}:{model}"
+        existing = self.budgets.get(key)
+        if existing is not None:
+            return existing
+
+        # Both tiers of every configured provider are created up front, so an
+        # unknown model here means a model nobody declared. Give it the smaller
+        # of the two allowances: pacing too slowly costs latency, pacing too
+        # fast costs 429s.
+        budget = TokenBudget(self._tpm.get((provider, tier or "fast"), 30_000), name=key)
+        self.budgets[key] = budget
+        return budget
+
     @property
     def active_providers(self) -> list[str]:
         return [p.name for p in self.providers if p.name not in self.disabled]
@@ -178,11 +223,11 @@ class LLMRouter:
                     # TPM is the binding constraint on free tiers, so the
                     # budget is checked in addition to the request bucket.
                     estimated = estimate_tokens(
-                        [m.content for m in msgs], max_output=max_tokens
+                        [m.content for m in msgs],
+                        max_output=min(max_tokens, OUTPUT_RESERVE_TOKENS),
                     )
-                    waited += await self.budgets[name].acquire(
-                        estimated, timeout=wait_budget
-                    )
+                    budget = self._budget(name, model)
+                    waited += await budget.acquire(estimated, timeout=wait_budget)
                     if waited > 0.5:
                         log.info("llm.rate_limit_wait", provider=name,
                                  seconds=round(waited, 1), est_tokens=estimated)
@@ -197,7 +242,7 @@ class LLMRouter:
                     breaker.record_success()
                     # Replace the estimate with what was actually consumed so
                     # estimation error does not accumulate across a long run.
-                    self.budgets[name].reconcile(estimated, usage.total)
+                    budget.reconcile(estimated, usage.total)
 
                     response = LLMResponse(
                         text=text,

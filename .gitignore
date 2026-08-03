@@ -17,6 +17,7 @@ __pycache__/
 node_modules/
 .next/
 out/
+*.tsbuildinfo
 frontend/.env*.local
 
 # --- Data --------------------------------------------------------------------

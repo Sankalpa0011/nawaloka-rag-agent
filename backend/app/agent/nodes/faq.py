@@ -232,6 +232,24 @@ def cache_write(state: AgentState) -> bool:
 #: a curated FAQ only ever holds general answers.
 LIVE_DATA_ENTITIES = {"doctor", "lab_test", "package", "weekday", "specialty"}
 
+#: Bare nouns for the *kinds* of record the database holds.
+#:
+#: The gazetteer only fires on a specific name, and the transactional lexicon
+#: only on words like "fee" or "available", so a question can ask for a whole
+#: table while triggering neither: "who are all the doctors in nawaloka?" was
+#: answered from the hospital-overview FAQ at similarity 0.80 with a list of
+#: specialist centres. "who are the doctors?" - the same question without the
+#: hospital name - scored below threshold and routed correctly to SQL, which is
+#: exactly the kind of coin-flip a similarity threshold cannot fix.
+#:
+#: Terms already covered by SQL_LEXICON (package, test, specialist, session)
+#: are deliberately not repeated here; this list is only the gap.
+LIVE_DATA_NOUNS = (
+    "doctor", "doctors", "doctor's", "doctors'",
+    "consultant", "consultants", "consultants'",
+    "physician", "physicians", "surgeon", "surgeons",
+)
+
 
 def needs_live_data(query: str) -> list[str]:
     """Entity kinds in the query that make a canned FAQ answer unsafe.
@@ -250,10 +268,15 @@ def needs_live_data(query: str) -> list[str]:
     or specialty is instead treated as a deterministic signal to let the router
     decide - so the fast path is bypassed structurally, not by tuning a number.
     """
-    from app.agent.signals import extract_signals
+    from app.agent.signals import _contains_term, extract_signals
 
     signals = extract_signals(query)
     blocking = sorted(set(signals.entities) & LIVE_DATA_ENTITIES)
+
+    text = " " + (query or "").lower().strip() + " "
+    nouns = [n for n in LIVE_DATA_NOUNS if _contains_term(text, n)]
+    if nouns:
+        blocking.append(f"record type ({nouns[0]})")
 
     # Entity matching alone is not enough either. It misses plurals with no
     # specific name ("show me all your doctors and their fees") and text buried
@@ -278,6 +301,14 @@ async def faq_node(state: AgentState) -> dict:
     query = state.get("contextual_query") or state["user_query"]
 
     blocking = needs_live_data(query)
+
+    # Someone describing an illness needs a clinic, not a stored string. The
+    # guardrail runs before this node and already knows; not asking it meant
+    # "my brother got cold who needs to contact?" was answered with the
+    # ambulance number, which is both wrong and alarming.
+    guard = state.get("guardrail") or {}
+    if "symptom_context" in (guard.get("flags") or []):
+        blocking.append("a symptom")
     if blocking:
         elapsed = int((time.perf_counter() - started) * 1000)
         log.info("faq.skipped_live_data", entities=blocking)

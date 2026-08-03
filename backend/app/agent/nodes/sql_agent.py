@@ -10,6 +10,7 @@ is still validated by the AST guard and executed read-only.
 from __future__ import annotations
 
 import time
+from functools import lru_cache
 from typing import Any
 
 from app.agent.state import AgentState, trace_event
@@ -69,6 +70,15 @@ for a field.
 So "what is Dr X's fee?" is {"name": "Dr X"} - NOT {"name": "Dr X",
 "max_fee": true}. Asking for a fee is not a filter on the fee.
 
+Every row already belongs to Nawaloka Hospitals, so "Nawaloka", "the hospital"
+or "all" is never a filter value. "Which doctors practise here?" is
+find_doctors with NO arguments - it returns the whole directory.
+
+A symptom in the patient's own words is NOT a specialty. "neuron issue",
+"chest pain", "my mother's stomach problem" -> suggest_specialty with the
+complaint. Only pass `specialty` when the question names an actual medical
+discipline.
+
 Rules:
 - weekday must be a weekday name; the tool handles doctors recorded as 'Daily'
 - "which package includes X" -> search_health_packages with includes_service: X
@@ -76,10 +86,40 @@ Rules:
 - prefer a curated tool; text2sql is the last resort"""
 
 
+@lru_cache(maxsize=1)
+def _specialty_roster() -> str:
+    """The specialties that actually exist, for the tool-choice prompt.
+
+    Without it the model guesses from the question's wording: "i need a heart
+    surgery doctor" became ``find_doctors(specialty="General Surgery &
+    Gastroenterology")``, which returned a real doctor for the wrong problem.
+    Read from the table so it cannot drift, and cached because it is per-turn.
+    """
+    try:
+        from app.tools.db import fetch
+
+        rows, _ = fetch("SELECT name FROM specialties ORDER BY name")
+        return ", ".join(str(r["name"]) for r in rows)
+    except Exception as exc:
+        log.warning("sql_agent.specialty_roster_unavailable", error=str(exc)[:160])
+        return ""
+
+
+def _tool_prompt() -> str:
+    roster = _specialty_roster()
+    if not roster:
+        return TOOL_PROMPT
+    return (
+        f"{TOOL_PROMPT}\n\nThe only specialties that exist here are: {roster}.\n"
+        "If the question does not name one of these, do not pick the nearest - "
+        "it is a complaint, so use suggest_specialty."
+    )
+
+
 async def _choose_tool(question: str) -> tuple[str, dict, str, str]:
     """Returns (tool_name, arguments, reason, provider)."""
     data, response = await get_router().complete_json(
-        [Msg("system", TOOL_PROMPT), Msg("user", f"Question: {question}")],
+        [Msg("system", _tool_prompt()), Msg("user", f"Question: {question}")],
         TOOL_SCHEMA,
         tier="fast",
         max_tokens=400,
@@ -95,6 +135,34 @@ async def _choose_tool(question: str) -> tuple[str, dict, str, str]:
 _NUMERIC_ARGS = {"max_fee", "max_price", "max_report_hours", "limit"}
 #: Parameters that are genuinely true/false switches.
 _BOOLEAN_ARGS = {"include_schedule", "fasting_required"}
+
+#: Text filter values that cannot narrow anything, so passing one can only
+#: destroy a result set.
+#:
+#: The observed failure was ``find_doctors(department="Nawaloka Hospitals")``
+#: for "which doctors practise here?" - the model read the institution from the
+#: question and filed it as a filter, producing
+#: ``department ILIKE '%Nawaloka Hospitals%'``, zero rows, and a flatly
+#: confident "I do not have that information" about a directory of eleven
+#: doctors. Every value here means "no filter", so dropping it is always
+#: closer to the user's intent than applying it.
+_STOP_FILTER_VALUES = {
+    # The hospital's own name. Every row in the database belongs to it, so it
+    # is never a discriminating value for any column.
+    "nawaloka", "nawaloka hospital", "nawaloka hospitals",
+    "nawaloka hospitals plc", "nawaloka hospital plc",
+    "hospital", "the hospital", "this hospital",
+    # Placeholders a model reaches for when the schema wants a value it does
+    # not have.
+    "all", "any", "*", "none", "null", "n/a", "na", "nil",
+    "unknown", "unspecified", "everything", "everyone",
+    "all departments", "any department", "all specialties", "any specialty",
+    "all doctors", "all tests", "all packages",
+}
+
+
+def _normalise_value(value: Any) -> str:
+    return " ".join(str(value).lower().split()).strip(" .,'\"")
 
 
 def _coerce_args(args: dict[str, Any], accepted: set[str]) -> tuple[dict, list[str]]:
@@ -137,9 +205,62 @@ def _coerce_args(args: dict[str, Any], accepted: set[str]) -> tuple[dict, list[s
             continue
 
         # Everything else is free text.
-        cleaned[key] = value if isinstance(value, str) else str(value)
+        text = value if isinstance(value, str) else str(value)
+        if _normalise_value(text) in _STOP_FILTER_VALUES:
+            problems.append(f"{key}={text!r} (matches every row, so it filters nothing)")
+            continue
+        cleaned[key] = text
 
     return cleaned, problems
+
+
+#: Arguments that may accompany a specialty without making a zero-row result
+#: meaningful. A weekday or fee filter can legitimately empty a result set
+#: ("no cardiologist on Sunday"), and re-reading the query as a complaint would
+#: silently drop that constraint.
+_COMPLAINT_RETRY_ARGS = {"specialty", "department", "name", "include_schedule", "limit"}
+
+
+def _complaint_subject(cleaned: dict[str, Any]) -> str | None:
+    """The argument value worth re-reading as a complaint, if any."""
+    for key in ("specialty", "department"):
+        if cleaned.get(key):
+            return str(cleaned[key])
+
+    # A name is different in kind. A genuine name matching nothing means that
+    # doctor does not work here, and saying so is the correct answer - so this
+    # only fires when the value is plainly a symptom. Observed:
+    # ``find_doctors(name="fever")``, which reported no such doctor.
+    name = cleaned.get("name")
+    if name and sql_tools.looks_like_complaint(str(name)):
+        return str(name)
+    return None
+
+
+def _retry_as_complaint(specialty: str) -> SqlToolResult:
+    """Re-read a specialty that matched nothing as a description of the problem.
+
+    Patients name the problem, not the discipline: "my mother got neuron issue,
+    who is the doctor I need to contact?" was filed as
+    ``find_doctors(specialty="neuron issues")``, which matched no specialty and
+    dead-ended on "our database does not have any records" - to a question with
+    a perfectly good answer. ``suggest_specialty`` exists for exactly this and
+    never returns nothing, falling back to General Medicine as a starting point.
+
+    Recovering here rather than in the prompt makes it deterministic: the model
+    only has to reach the doctor table, not to have classified the phrasing
+    correctly first.
+    """
+    result = sql_tools.suggest_specialty(specialty)
+    result.notes.insert(
+        0,
+        f"'{specialty}' is not a specialty in the database, so it was re-read as a "
+        "description of the problem. Answer the question that was asked - do not "
+        "mention the failed lookup, and do not present this as a diagnosis.",
+    )
+    log.info("sql_agent.retried_as_complaint", specialty=specialty[:60],
+             rows=result.row_count)
+    return result
 
 
 def _call_curated(tool: str, args: dict[str, Any]) -> SqlToolResult:
@@ -153,6 +274,17 @@ def _call_curated(tool: str, args: dict[str, Any]) -> SqlToolResult:
     cleaned, problems = _coerce_args(args, accepted)
 
     result = fn(**cleaned)
+
+    subject = _complaint_subject(cleaned)
+    if (
+        tool == "find_doctors"
+        and not result.error
+        and result.row_count == 0
+        and subject
+        and set(cleaned) <= _COMPLAINT_RETRY_ARGS
+    ):
+        result = _retry_as_complaint(str(subject))
+
     if problems:
         log.warning("sql_agent.bad_arguments", tool=tool, problems=problems)
         result.notes.append("Ignored invalid argument(s): " + "; ".join(problems))

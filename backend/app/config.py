@@ -54,8 +54,14 @@ class Settings(BaseSettings):
     # Tokens per minute. This, not RPM, is the binding free-tier constraint:
     # Groq allows 6,000 TPM on llama-3.1-8b-instant, so a 1,400-token prompt
     # caps throughput at ~4 requests/minute regardless of the RPM headroom.
+    #
+    # Published per model, so the strong tier gets its own figure - Groq's
+    # llama-3.3-70b-versatile allows 12,000 TPM, and pacing synthesis against
+    # the 8b model's 6,000 throttled it at half its real allowance.
     gemini_tpm: int = 250_000
+    gemini_tpm_strong: int = 250_000
     groq_tpm: int = 6_000
+    groq_tpm_strong: int = 12_000
 
     # --- Postgres ------------------------------------------------------------
     database_url: str = "postgresql://nawaloka:nawaloka_dev_pw@localhost:5433/nawaloka"

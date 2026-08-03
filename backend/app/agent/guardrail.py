@@ -136,7 +136,15 @@ def _is_service_question(text: str) -> bool:
 # a "this is not a diagnosis" framing.
 SYMPTOM_HINT = re.compile(
     r"\b(pain|ache|aching|fever|cough|rash|swelling|dizzy|dizziness|nausea|"
-    r"vomit|bleeding|lump|tired|fatigue|breathless|sore|infection|injur)",
+    r"vomit|bleeding|lump|tired|fatigue|breathless|sore|infection|injur|"
+    # Everyday illnesses were missing entirely, and their absence was not
+    # cosmetic: "my brother got cold who needs to contact?" was not flagged, so
+    # it reached the FAQ fast path and came back with the ambulance number.
+    r"cold|flu\b|influenza|headache|migraine|allerg|itch|burn|sprain|fracture|"
+    # "numbness", not "numb": the pattern is prefix-matched, so bare "numb"
+    # also claims "number" and put a medical disclaimer on every request for a
+    # phone number.
+    r"diarrh|constipat|heartburn|wheez|numbness|weakness|blurred|stomach)",
     re.I,
 )
 

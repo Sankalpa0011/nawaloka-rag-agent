@@ -25,8 +25,11 @@ by the same code that handles it.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
+from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any
 
 from app.logging_conf import get_logger
@@ -41,6 +44,43 @@ WEEKDAYS = (
 # pg_trgm similarity floor for fuzzy name matching. 0.3 tolerates honorifics,
 # spelling drift and partial surnames without matching unrelated doctors.
 NAME_SIMILARITY = 0.3
+
+# Specialties need a higher floor than people do. Personal names are
+# idiosyncratic, so two doctors rarely resemble each other; specialty names are
+# formulaic and share whole words, so they collide with each other far more
+# readily than a misspelling collides with its target. Measured over the live
+# table:
+#
+#   worst wrong pair    ENT Surgery  ~ Neurosurgery                    0.316
+#   genuine variants    'rheumatology', 'cardilogy', 'neuro surgery',
+#                       'pediatrics', 'chest medicine', ...       0.448-0.769
+#
+# Specialties are matched on their *distinctive* word, not on whole-string
+# similarity, and that is a measured decision rather than a stylistic one.
+#
+# At 0.3 whole-string similarity, "neuro surgery" returned the ENT surgeon
+# alongside the neurosurgeon. Raising the floor cannot fix it, because the two
+# populations overlap completely - measured over the live table:
+#
+#   'eye surgery'   no such specialty   -> ENT Surgery                   0.600
+#   'ent surgury'   genuine typo        -> ENT Surgery                   0.600
+#   'bone surgery'  no such specialty   -> ENT Surgery                   0.471
+#   'rhumatology'   genuine typo        -> Rheumatology & Sports Med.    0.323
+#
+# A real typo scoring below a phrase for a specialty that does not exist means
+# no cutoff separates them. The reason is structural: these names share head
+# nouns ("Surgery", "Medicine"), so similarity is dominated by the word that
+# carries no information. "eye surgery" and "ent surgury" differ precisely
+# where it matters and agree everywhere else.
+#
+# So the comparison is between distinctive tokens only - words that appear in
+# exactly one specialty name, derived from the table so they cannot drift from
+# the data. "eye" vs "ent" is then a poor match and "ent" vs "ent" a perfect
+# one, which is the distinction the whole-string score could not see.
+SPECIALTY_TOKEN_MATCH = 0.80
+
+#: Query tokens shorter than this carry too little signal to match on.
+_MIN_TOKEN_LEN = 3
 
 
 @dataclass
@@ -82,6 +122,107 @@ def _normalise_weekday(value: str | None) -> str | None:
     return aliases.get(v)
 
 
+def _words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z]+", (text or "").lower()) if len(w) >= _MIN_TOKEN_LEN]
+
+
+@lru_cache(maxsize=2)
+def _vocabulary(column: str) -> tuple[dict[str, frozenset[str]], frozenset[str]]:
+    """``(name -> distinctive words, words shared by several names)``.
+
+    Derived from the table rather than hardcoded, so adding a specialty or
+    renaming a department cannot leave a stale list behind.
+    """
+    try:
+        rows, _ = fetch(f"SELECT DISTINCT {column} AS name FROM specialties")
+    except Exception as exc:
+        log.warning("vocabulary.unavailable", column=column, error=str(exc)[:160])
+        return {}, frozenset()
+
+    per_name = {str(r["name"]): set(_words(str(r["name"]))) for r in rows}
+    counts = Counter(w for words in per_name.values() for w in words)
+    shared = frozenset(w for w, n in counts.items() if n > 1)
+    # A name whose every word is shared keeps them all; it has nothing more
+    # distinctive to offer.
+    return (
+        {name: frozenset((words - shared) or words) for name, words in per_name.items()},
+        shared,
+    )
+
+
+def _specialty_tokens() -> tuple[dict[str, frozenset[str]], frozenset[str]]:
+    return _vocabulary("name")
+
+
+def _word_match(query_word: str, specialty_word: str) -> float:
+    """How strongly one word stands for another.
+
+    Prefixes are treated as near-exact because that is how these are shortened
+    in practice - "neuro" for "neurosurgery" - while plain edit similarity
+    would score that pair only 0.59 and reject it. The prefix must be long
+    enough to be meaningful, which is what keeps "ent" from claiming "dental".
+    """
+    if query_word == specialty_word:
+        return 1.0
+    if len(query_word) >= 4 and specialty_word.startswith(query_word):
+        return 0.95
+    return SequenceMatcher(None, query_word, specialty_word).ratio()
+
+
+def _resolve_against(text: str, column: str) -> str | None:
+    """The one name in ``column`` that a phrase means, or ``None`` if unclear.
+
+    Returning ``None`` is the useful half of this function: an unresolvable
+    phrase falls through to a literal match rather than a confident wrong one,
+    and a phrase that matches nothing literally then reaches the complaint
+    path - which is where a symptom belonged in the first place.
+    """
+    q = (text or "").strip()
+    if not q:
+        return None
+
+    tokens, shared = _vocabulary(column)
+    if not tokens:
+        return None
+
+    # A literal substring needs no guessing, and if several names contain the
+    # phrase the user really did mean all of them - ILIKE is correct there.
+    if any(q.lower() in name.lower() for name in tokens):
+        return None
+
+    # Drop the words every name shares; they are what made "eye surgery" look
+    # like ENT Surgery. If nothing is left, the phrase is entirely generic and
+    # there is nothing to resolve.
+    query_words = [w for w in _words(q) if w not in shared]
+    if not query_words:
+        return None
+
+    scored = sorted(
+        (
+            (max(_word_match(qw, nw) for qw in query_words for nw in name_words), name)
+            for name, name_words in tokens.items()
+        ),
+        reverse=True,
+    )
+    top_score, top_name = scored[0]
+    runner_up = scored[1][0] if len(scored) > 1 else 0.0
+    if top_score < SPECIALTY_TOKEN_MATCH or top_score == runner_up:
+        return None
+    return top_name
+
+
+def _resolve_specialty(text: str) -> str | None:
+    return _resolve_against(text, "name")
+
+
+def _resolve_department(text: str) -> str | None:
+    return _resolve_against(text, "department")
+
+
+def reset_specialty_cache() -> None:
+    _vocabulary.cache_clear()
+
+
 def _run(tool: str, sql: str, params: dict[str, Any]) -> SqlToolResult:
     try:
         rows, ms = fetch(sql, params)
@@ -119,15 +260,32 @@ def find_doctors(
     day = _normalise_weekday(weekday)
 
     if specialty:
-        where.append(
-            "(d.specialty ILIKE :specialty OR similarity(d.specialty, :specialty_raw) > :sim)"
-        )
-        params["specialty"] = f"%{specialty}%"
-        params["specialty_raw"] = specialty
-        params["sim"] = NAME_SIMILARITY
+        resolved = _resolve_specialty(specialty)
+        if resolved:
+            where.append("d.specialty = :specialty_exact")
+            params["specialty_exact"] = resolved
+        else:
+            # Not confidently one specialty: match literally rather than guess.
+            where.append("d.specialty ILIKE :specialty")
+            params["specialty"] = f"%{specialty}%"
     if department:
-        where.append("d.department ILIKE :department")
-        params["department"] = f"%{department}%"
+        # Departments carry internal names no patient uses - Paediatrics sits in
+        # "Paediatric Care", Cardiology in "Heart Centre" - so a value here is
+        # usually either a near-miss on the department or a specialty filed
+        # under the wrong argument. Observed: department="Paediatrics" matched
+        # nothing and the answer said no paediatrician existed, next to a
+        # correctly named Paediatrics doctor.
+        resolved_dept = _resolve_department(department)
+        resolved_spec = None if resolved_dept else _resolve_specialty(department)
+        if resolved_dept:
+            where.append("d.department = :department_exact")
+            params["department_exact"] = resolved_dept
+        elif resolved_spec:
+            where.append("d.specialty = :department_as_specialty")
+            params["department_as_specialty"] = resolved_spec
+        else:
+            where.append("(d.department ILIKE :department OR d.specialty ILIKE :department)")
+            params["department"] = f"%{department}%"
     if name:
         where.append(
             "(d.name_plain ILIKE :name OR d.doctor_name ILIKE :name "
@@ -192,8 +350,27 @@ def find_doctors(
             "which expands the literal 'Daily' schedule value into every weekday.",
         )
     if not result.rows:
+        # Name the filters. "No doctor matches" on its own gives the synthesiser
+        # nothing to work with and it falls back to "I do not have that
+        # information", which reads as though the directory itself is missing.
+        applied = ", ".join(
+            f"{label}={value}"
+            for label, value in (
+                ("specialty", specialty), ("name", name), ("department", department),
+                ("weekday", day), ("max_fee", max_fee),
+            )
+            if value
+        )
+        # Naming the filters helps the answer be specific, but the phrasing
+        # matters: an earlier version asked the model to "state which criteria
+        # were searched" and it dutifully wrote "the database was searched for
+        # a doctor matching the criteria 'fever'", exposing a bad filter to the
+        # patient as though it were their question.
         result.notes.append(
-            "No doctor in the database matches those criteria. Do not suggest one anyway."
+            "No doctor matches those criteria"
+            + (f" ({applied})" if applied else "")
+            + ". Do not suggest one anyway. Answer in the patient's own terms and "
+            "never mention the database, the query or the filter values."
         )
     return result
 
@@ -450,6 +627,20 @@ SYMPTOM_SPECIALTY_HINTS: dict[str, tuple[str, ...]] = {
     "headache": ("Neurosurgery", "General Medicine"),
     "migraine": ("Neurosurgery", "General Medicine"),
     "seizure": ("Neurosurgery",),
+    # Patients describe this area in many lay forms and almost never as
+    # "neurosurgery" - "neuron issue" mapped to nothing and the turn dead-ended.
+    # The keys are matched as prefixes, so "neuro" also covers neurological,
+    # neurology and neurone.
+    "neuro": ("Neurosurgery",),
+    "nerve": ("Neurosurgery",),
+    "brain": ("Neurosurgery",),
+    "spine": ("Neurosurgery", "Rheumatology & Sports Medicine"),
+    "spinal": ("Neurosurgery",),
+    "stroke": ("Neurosurgery", "General Medicine"),
+    "paralysis": ("Neurosurgery",),
+    "numbness": ("Neurosurgery",),
+    "dizziness": ("Neurosurgery", "ENT Surgery"),
+    "memory loss": ("Neurosurgery", "General Medicine"),
     "ear": ("ENT Surgery",),
     "nose": ("ENT Surgery",),
     "throat": ("ENT Surgery",),
@@ -474,9 +665,26 @@ SYMPTOM_SPECIALTY_HINTS: dict[str, tuple[str, ...]] = {
     "x-ray": ("Radiology & Imaging",),
     "mri": ("Radiology & Imaging",),
     "fever": ("General Medicine",),
+    "cold": ("General Medicine",),
+    "flu": ("General Medicine",),
+    "sore throat": ("General Medicine", "ENT Surgery"),
     "diabetes": ("General Medicine",),
     "blood pressure": ("General Medicine",),
 }
+
+
+def looks_like_complaint(text: str) -> bool:
+    """Whether a phrase describes a problem rather than naming a record.
+
+    Used to tell a symptom apart from a person, because the right answer for
+    each is opposite: a name that matches nothing means that doctor does not
+    work here, and saying so is correct. "fever" filed as a doctor's name is
+    not that - it is a question about being unwell.
+    """
+    lowered = (text or "").lower()
+    return any(
+        re.search(rf"\b{re.escape(key)}", lowered) for key in SYMPTOM_SPECIALTY_HINTS
+    )
 
 
 def suggest_specialty(complaint: str) -> SqlToolResult:

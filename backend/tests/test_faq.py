@@ -13,6 +13,7 @@ from app.agent.nodes.faq import (
     CURATED_THRESHOLD,
     cache_eligibility,
     faq_lookup,
+    faq_node,
     needs_live_data,
 )
 from app.ingest.faq_seed import FAQS
@@ -81,6 +82,52 @@ class TestLiveDataBypass:
     def test_heart_centre_regression(self):
         """Regression: this returned a list of every centre instead."""
         assert needs_live_data("What services does the Heart Centre offer?")
+
+    @pytest.mark.parametrize("query", [
+        "who are the all doctors in nawaloka?",
+        "who are the doctors ?",
+        "list your consultants",
+        "which surgeons work here",
+        "do you have physicians",
+    ])
+    def test_asking_for_a_whole_table_bypasses_the_faq(self, query: str):
+        """Regression: naming a record *type* without naming a record.
+
+        The gazetteer only fires on a specific name and the transactional
+        lexicon only on words like "fee", so these triggered neither. "who are
+        the all doctors in nawaloka?" matched the hospital-overview FAQ at 0.80
+        and was answered with a list of specialist centres, while the same
+        question without "nawaloka" scored under threshold and routed correctly
+        - a coin flip no similarity cutoff can settle.
+        """
+        blocking = needs_live_data(query)
+        assert blocking, f"{query!r} asks for database rows and must bypass the FAQ"
+        assert any("record type" in b for b in blocking)
+
+    @pytest.mark.parametrize("query", [
+        "my brother got cold who needs to contact?",
+        "my child has flu, who should we see?",
+    ])
+    async def test_a_symptom_never_gets_a_canned_answer(self, query: str):
+        """Regression: a common cold was answered with the ambulance number.
+
+        The guardrail runs before this node and already classifies these as
+        SYMPTOM; the fast path simply was not asking. Someone describing an
+        illness needs a clinic, not a stored string.
+        """
+        state = {
+            "user_query": query,
+            "contextual_query": query,
+            "guardrail": {"flags": ["symptom_context"]},
+        }
+        out = await faq_node(state)
+        assert out["cache"]["status"] == "bypassed"
+        assert "symptom" in out["cache"]["reason"]
+        assert "answer" not in out
+
+    def test_the_hospital_overview_faq_still_works(self):
+        """The bypass must not swallow the general question it sits next to."""
+        assert not needs_live_data("Tell me about Nawaloka Hospitals")
 
 
 # ---------------------------------------------------------------------------

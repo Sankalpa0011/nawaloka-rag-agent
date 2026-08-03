@@ -149,16 +149,34 @@ class CircuitBreaker:
 
     threshold: int = 3
     cooldown: float = 60.0
+    max_cooldown: float = 900.0
     name: str = ""
     failures: int = 0
+    reopens: int = 0
     opened_at: float | None = None
     _half_open: bool = field(default=False, repr=False)
+
+    @property
+    def current_cooldown(self) -> float:
+        """Cooldown for this open period, doubling each time a trial fails.
+
+        A provider whose trial request keeps failing is not briefly throttled,
+        it is out of quota for the day, and a fixed 60s cooldown re-probes it
+        forever. The cost is not just the wasted round-trip: an open circuit is
+        what removes a provider from the router's eligible list, and while a
+        dead provider still *looks* eligible the router keeps its failover wait
+        short - so the one healthy provider is never allowed to wait out its own
+        token budget. Observed with Gemini's daily quota exhausted: Groq had
+        4,180 of 6,000 tokens free and needed 5,045, which one minute of waiting
+        would have covered, but the turn failed outright instead.
+        """
+        return min(self.max_cooldown, self.cooldown * (2 ** self.reopens))
 
     @property
     def is_open(self) -> bool:
         if self.opened_at is None:
             return False
-        if time.monotonic() - self.opened_at >= self.cooldown:
+        if time.monotonic() - self.opened_at >= self.current_cooldown:
             # Cooldown elapsed: allow a single trial request through.
             self._half_open = True
             return False
@@ -168,26 +186,29 @@ class CircuitBreaker:
         if self.failures or self.opened_at:
             log.info("circuit.closed", provider=self.name)
         self.failures = 0
+        self.reopens = 0
         self.opened_at = None
         self._half_open = False
 
     def record_failure(self) -> None:
         self.failures += 1
         if self._half_open:
-            # The trial request failed - re-open for another full cooldown.
+            # The trial request failed, so back off for twice as long.
+            self.reopens += 1
             self.opened_at = time.monotonic()
             self._half_open = False
-            log.warning("circuit.reopened", provider=self.name, failures=self.failures)
+            log.warning("circuit.reopened", provider=self.name,
+                        failures=self.failures, cooldown=self.current_cooldown)
             return
         if self.failures >= self.threshold and self.opened_at is None:
             self.opened_at = time.monotonic()
             log.warning("circuit.opened", provider=self.name,
-                        failures=self.failures, cooldown=self.cooldown)
+                        failures=self.failures, cooldown=self.current_cooldown)
 
     def seconds_until_retry(self) -> float:
         if self.opened_at is None:
             return 0.0
-        return max(0.0, self.cooldown - (time.monotonic() - self.opened_at))
+        return max(0.0, self.current_cooldown - (time.monotonic() - self.opened_at))
 
     def status(self) -> str:
         if self.is_open:

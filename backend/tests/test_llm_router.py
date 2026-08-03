@@ -72,10 +72,20 @@ def build_router(
     router = LLMRouter.__new__(LLMRouter)  # bypass config-driven __init__
     router.providers = list(providers)
     router.buckets = {p.name: AsyncTokenBucket(rpm, name=p.name) for p in providers}
-    router.budgets = {p.name: TokenBudget(tpm, name=p.name) for p in providers}
     router.breakers = {p.name: CircuitBreaker(name=p.name) for p in providers}
     router.disabled = {}
+    router._tpm = {}
+    router.budgets = {}
+    for p in providers:
+        for tier in ("fast", "strong"):
+            router._tpm[(p.name, tier)] = tpm
+            router._budget(p.name, p.model_for(tier), tier=tier)
     return router
+
+
+def budget_key(provider: str, tier: str = "fast") -> str:
+    """Budgets are per provider *and* model, because the limits are."""
+    return f"{provider}:{provider}-{tier}"
 
 
 MSGS = [Msg("user", "hi")]
@@ -157,8 +167,8 @@ class TestFailover:
         when another provider has headroom."""
         a, b = FakeProvider("a", ["A"]), FakeProvider("b", ["B"])
         r = build_router(a, b)
-        r.budgets["a"] = TokenBudget(tpm=10, name="a")   # effectively exhausted
-        await r.budgets["a"].acquire(10)
+        r.budgets[budget_key("a")] = TokenBudget(tpm=10, name="a")   # effectively exhausted
+        await r.budgets[budget_key("a")].acquire(10)
 
         started = time.monotonic()
         resp = await r.complete(MSGS)
@@ -170,8 +180,8 @@ class TestFailover:
         """Being at quota is not a fault; the provider must stay eligible."""
         a, b = FakeProvider("a", ["A"]), FakeProvider("b", ["B"])
         r = build_router(a, b)
-        r.budgets["a"] = TokenBudget(tpm=10, name="a")
-        await r.budgets["a"].acquire(10)
+        r.budgets[budget_key("a")] = TokenBudget(tpm=10, name="a")
+        await r.budgets[budget_key("a")].acquire(10)
 
         await r.complete(MSGS)
         assert r.breakers["a"].failures == 0
@@ -181,8 +191,8 @@ class TestFailover:
         """With nothing to fail over to, waiting beats failing."""
         a = FakeProvider("a", ["A"])
         r = build_router(a)
-        r.budgets["a"] = TokenBudget(tpm=600, name="a")
-        await r.budgets["a"].acquire(300)
+        r.budgets[budget_key("a")] = TokenBudget(tpm=600, name="a")
+        await r.budgets[budget_key("a")].acquire(300)
 
         resp = await r.complete(MSGS, max_tokens=100)
         assert resp.provider == "a"
@@ -198,10 +208,10 @@ class TestFailover:
         a, b = FakeProvider("a", ["A"]), FakeProvider("b", ["B"])
         r = build_router(a, b)
         # Both throttled; b has just enough headroom if we are willing to wait.
-        r.budgets["a"] = TokenBudget(tpm=60, name="a")
-        r.budgets["b"] = TokenBudget(tpm=600, name="b")
-        await r.budgets["a"].acquire(60)
-        await r.budgets["b"].acquire(300)
+        r.budgets[budget_key("a")] = TokenBudget(tpm=60, name="a")
+        r.budgets[budget_key("b")] = TokenBudget(tpm=600, name="b")
+        await r.budgets[budget_key("a")].acquire(60)
+        await r.budgets[budget_key("b")].acquire(300)
 
         resp = await r.complete(MSGS, max_tokens=100)
         assert resp.provider == "b", "last provider must wait rather than fail"
@@ -211,6 +221,47 @@ class TestFailover:
 # ---------------------------------------------------------------------------
 # Circuit breaker
 # ---------------------------------------------------------------------------
+class TestBudgetAccounting:
+    """What the budget charges decides which provider serves the turn."""
+
+    async def test_a_high_ceiling_is_not_charged_as_if_it_were_spent(self):
+        """Regression: ``max_tokens`` is a ceiling, not a prediction.
+
+        Synthesis sets 2500 only so Gemini's thinking tokens cannot truncate
+        the visible answer. Charging that ceiling made a full-directory
+        synthesis estimate 5,045 tokens against Groq's 6,000/min, so the fast
+        provider was declared throttled and the turn was handed to Gemini,
+        which was 503-ing under load: 52 seconds for an answer Groq returns in
+        under one. ``reconcile`` corrects the estimate from real usage
+        afterwards, so a modest reserve is both more accurate and self-healing.
+        """
+        a, b = FakeProvider("a", ["A"]), FakeProvider("b", ["B"])
+        r = build_router(a, b, tpm=1500)
+        await r.budgets[budget_key("a")].acquire(500)
+
+        resp = await r.complete(MSGS, max_tokens=100_000)
+        assert resp.provider == "a", "a ceiling of 100k must not evict the fast provider"
+
+    async def test_each_tier_is_budgeted_separately(self):
+        """Token allowances are published per model, not per provider.
+
+        Groq allows 6,000 TPM on llama-3.1-8b-instant and 12,000 on
+        llama-3.3-70b-versatile. A single shared counter paces synthesis at
+        half its real allowance.
+        """
+        a, b = FakeProvider("a", ["A"]), FakeProvider("b", ["B"])
+        r = build_router(a, b, tpm=100)
+        await r.budgets[budget_key("a", "fast")].acquire(100)  # fast tier spent
+
+        resp = await r.complete(MSGS, tier="strong", max_tokens=10)
+        assert resp.provider == "a", "an exhausted fast tier must not throttle the strong one"
+
+    def test_budgets_are_keyed_by_provider_and_model(self):
+        a = FakeProvider("a", [])
+        r = build_router(a)
+        assert set(r.budgets) == {"a:a-fast", "a:a-strong"}
+
+
 class TestCircuitBreaker:
     def test_opens_after_threshold(self):
         cb = CircuitBreaker(threshold=3, cooldown=60)
@@ -232,26 +283,66 @@ class TestCircuitBreaker:
         """Age the breaker past its cooldown without sleeping.
 
         Sleeping just over the cooldown is inherently racy on a loaded machine;
-        rewinding the clock makes the test deterministic.
+        rewinding the clock makes the test deterministic. Reading ``is_open``
+        afterwards is what flips the breaker to half-open, so the next
+        ``record_failure`` counts as a failed trial rather than a fresh one.
         """
-        cb.opened_at = time.monotonic() - cb.cooldown - 0.01
+        cb.opened_at = time.monotonic() - cb.current_cooldown - 0.01
+        assert not cb.is_open
 
     def test_half_opens_after_cooldown(self):
         cb = CircuitBreaker(threshold=1, cooldown=60)
         cb.record_failure()
         assert cb.is_open
         self._expire(cb)
-        assert not cb.is_open
         assert cb.status() == "half_open"
 
     def test_failed_trial_reopens_for_full_cooldown(self):
         cb = CircuitBreaker(threshold=1, cooldown=60)
         cb.record_failure()
-        self._expire(cb)
-        assert not cb.is_open       # half-open, trial allowed
+        self._expire(cb)            # half-open, trial allowed
         cb.record_failure()         # trial fails
         assert cb.is_open, "a failed trial must re-open the circuit"
         assert cb.seconds_until_retry() > 50, "must wait a full cooldown again"
+
+    def test_repeated_failed_trials_back_off_exponentially(self):
+        """A provider out of daily quota must not be re-probed every minute.
+
+        An open circuit is what takes a provider out of the router's eligible
+        list, and only when no eligible provider is left does the router allow
+        the survivor to wait out its own token budget. So a dead provider that
+        keeps looking half-open does not merely waste a round-trip - it starves
+        the healthy one of the wait it needed to succeed.
+        """
+        cb = CircuitBreaker(threshold=1, cooldown=60, max_cooldown=900)
+        cb.record_failure()
+        assert cb.current_cooldown == 60
+
+        for expected in (120, 240, 480):
+            self._expire(cb)
+            cb.record_failure()
+            assert cb.current_cooldown == expected
+
+    def test_backoff_is_capped(self):
+        cb = CircuitBreaker(threshold=1, cooldown=60, max_cooldown=900)
+        cb.record_failure()
+        for _ in range(12):
+            self._expire(cb)
+            cb.record_failure()
+        assert cb.current_cooldown == 900
+
+    def test_success_clears_the_backoff(self):
+        """Recovery must be immediate - yesterday's outage cannot park a live key."""
+        cb = CircuitBreaker(threshold=1, cooldown=60)
+        cb.record_failure()
+        self._expire(cb)
+        cb.record_failure()
+        assert cb.reopens == 1
+
+        cb.record_success()
+        assert cb.reopens == 0
+        assert not cb.is_open
+        assert cb.current_cooldown == 60
 
     async def test_open_circuit_is_skipped_without_calling_provider(self):
         a, b = FakeProvider("a", ["A"]), FakeProvider("b", ["B"])
