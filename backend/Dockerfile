@@ -21,18 +21,21 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
-COPY data ./data
-COPY evals ./evals
-COPY pytest.ini .
-
 # fastembed pulls its ONNX models on first use. Baking them in keeps the first
 # request fast and lets the container run without outbound network access.
+# This sits ABOVE the source COPY deliberately: it depends only on the installed
+# packages, so keeping it there means editing app code does not re-download
+# ~500 MB of models on every rebuild.
 RUN python -c "from fastembed import TextEmbedding, SparseTextEmbedding; \
 from fastembed.rerank.cross_encoder import TextCrossEncoder; \
 TextEmbedding('BAAI/bge-small-en-v1.5'); \
 SparseTextEmbedding('Qdrant/bm25'); \
 TextCrossEncoder('Xenova/ms-marco-MiniLM-L-6-v2')"
+
+COPY app ./app
+COPY data ./data
+COPY evals ./evals
+COPY pytest.ini .
 
 EXPOSE 8001
 
