@@ -156,14 +156,16 @@ export default function Page() {
   return (
     <div className="page">
       <header>
+        <div>
+          <h1>Nawaloka Hospitals Assistant</h1>
+          <p>Doctors, channeling times, lab tests, health packages and hospital services.</p>
+        </div>
         <span className="status">
           <span
             className={`dot ${online === null ? "" : online ? "ok" : "down"}`}
           />
           {online === null ? "checking" : online ? "connected" : "backend offline"}
         </span>
-        <h1>Nawaloka Hospitals Assistant</h1>
-        <p>Doctors, channeling times, lab tests, health packages and hospital services.</p>
       </header>
 
       <div className="messages">

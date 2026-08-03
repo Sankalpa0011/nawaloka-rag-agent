@@ -30,18 +30,24 @@ body {
 }
 
 .page {
-  max-width: 780px;
+  max-width: 860px;
   margin: 0 auto;
-  padding: 24px 16px 0;
+  padding: 0 20px;
   display: flex;
   flex-direction: column;
+  /* dvh accounts for mobile browser chrome; vh is the fallback. */
   height: 100vh;
+  height: 100dvh;
 }
 
 header {
   border-bottom: 1px solid var(--border);
-  padding-bottom: 12px;
-  margin-bottom: 8px;
+  padding: 20px 0 12px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-shrink: 0;
 }
 
 header h1 {
@@ -56,9 +62,10 @@ header p {
 }
 
 .status {
-  float: right;
   font-size: 12px;
   color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .status .dot {
@@ -81,11 +88,39 @@ header p {
 .messages {
   flex: 1;
   overflow-y: auto;
-  padding: 8px 0 16px;
+  /* Without min-height:0 a flex child refuses to shrink below its content,
+     so the list overflows the page instead of scrolling inside it. */
+  min-height: 0;
+  padding: 18px 0 8px;
+  scrollbar-width: thin;
+  scrollbar-color: #cfd6d9 transparent;
+}
+
+.messages::-webkit-scrollbar {
+  width: 10px;
+}
+
+.messages::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.messages::-webkit-scrollbar-thumb {
+  background: #cfd6d9;
+  border-radius: 6px;
+  /* Inset the thumb so it does not sit flush against the text. */
+  border: 3px solid var(--bg);
+}
+
+.messages::-webkit-scrollbar-thumb:hover {
+  background: #b3bec3;
 }
 
 .msg {
-  margin-bottom: 18px;
+  margin-bottom: 22px;
+}
+
+.msg:last-child {
+  margin-bottom: 8px;
 }
 
 .msg .who {
@@ -313,24 +348,29 @@ form.composer {
   display: flex;
   gap: 8px;
   background: var(--bg);
+  flex-shrink: 0;
 }
 
 form.composer input {
   flex: 1;
-  padding: 10px 12px;
+  min-width: 0;
+  padding: 11px 14px;
   border: 1px solid var(--border);
   border-radius: 8px;
+  /* 16px stops iOS Safari zooming the page when the field is focused. */
   font: inherit;
+  font-size: 15px;
   background: var(--panel);
 }
 
 form.composer input:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(10, 125, 125, 0.12);
 }
 
 form.composer button {
-  padding: 10px 18px;
+  padding: 11px 20px;
   border: none;
   border-radius: 8px;
   background: var(--accent);
@@ -338,11 +378,42 @@ form.composer button {
   font: inherit;
   font-weight: 600;
   cursor: pointer;
+  flex-shrink: 0;
+}
+
+form.composer button:hover:not(:disabled) {
+  background: #096a6a;
 }
 
 form.composer button:disabled {
   background: #b7c1c3;
   cursor: not-allowed;
+}
+
+/* --- narrow screens ----------------------------------------------------- */
+@media (max-width: 640px) {
+  .page {
+    padding: 0 12px;
+  }
+
+  header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    padding-top: 14px;
+  }
+
+  .bubble {
+    padding: 9px 11px;
+  }
+
+  pre.sql {
+    font-size: 10.5px;
+  }
+
+  form.composer button {
+    padding: 11px 16px;
+  }
 }
 
 .thinking {
