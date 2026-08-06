@@ -4,9 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { checkHealth, streamChat, type AgentEvent, type Citation } from "@/lib/api";
 import { Markdown } from "@/lib/markdown";
 
-// Everything the trace panel shows for one answer. Collected from the SSE
-// events as they arrive, so the panel reflects what actually happened rather
-// than a summary written after the fact.
+// Everything the trace panel shows for one answer, built from SSE events.
 type Details = {
   route?: string;
   confidence?: number;
@@ -45,14 +43,16 @@ export default function Page() {
   const [threadId, setThreadId] = useState<string | null>(null);
   const [online, setOnline] = useState<boolean | null>(null);
   const [error, setError] = useState("");
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     checkHealth().then((h) => setOnline(h?.status === "ok"));
   }, []);
 
+  // Keep the message list scrolled to bottom as tokens stream in.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const list = listRef.current;
+    if (list) list.scrollTop = list.scrollHeight;
   }, [messages, busy]);
 
   async function send(question: string) {
@@ -153,6 +153,10 @@ export default function Page() {
     }
   }
 
+  // "Thinking…" is only shown before the first token arrives.
+  const last = messages[messages.length - 1];
+  const streaming = last?.role === "assistant" && last.text.length > 0;
+
   return (
     <div className="page">
       <header>
@@ -168,40 +172,52 @@ export default function Page() {
         </span>
       </header>
 
-      <div className="messages">
+      {/* is-empty centres the welcome block when there's no thread yet. */}
+      <div
+        className={`messages${messages.length === 0 ? " is-empty" : ""}`}
+        ref={listRef}
+      >
         {messages.length === 0 && (
-          <div className="empty">
-            Ask about a doctor&apos;s fee, when a consultant channels, what a lab
-            test costs, or what one of our centres offers.
-            <ul className="examples">
+          <div className="welcome">
+            <h2>How can I help you today?</h2>
+            <p>
+              Ask about a doctor&apos;s fee, when a consultant channels, what a
+              lab test costs, or what one of our centres offers.
+            </p>
+            <div className="examples">
               {EXAMPLES.map((q) => (
-                <li key={q}>
-                  <button onClick={() => send(q)}>{q}</button>
-                </li>
+                <button key={q} onClick={() => send(q)}>
+                  {q}
+                </button>
               ))}
-            </ul>
+            </div>
           </div>
         )}
 
         {messages.map((m, i) => (
           <div key={i} className={`msg ${m.role}`}>
-            <div className="who">{m.role === "user" ? "You" : "Assistant"}</div>
-            <div className="bubble">
-              {m.role === "assistant" ? (
-                m.text ? <Markdown text={m.text} /> : "…"
-              ) : (
-                m.text
-              )}
-            </div>
+            {/* User messages are bubbles; assistant answers are plain text. */}
+            {m.role === "assistant" ? (
+              <div className="answer">
+                {m.text ? <Markdown text={m.text} /> : "…"}
+              </div>
+            ) : (
+              <div className="bubble">{m.text}</div>
+            )}
             {m.role === "assistant" && m.details && (
               <MessageMeta message={m} />
             )}
           </div>
         ))}
 
-        {busy && <div className="thinking">Thinking…</div>}
+        {busy && !streaming && (
+          <div className="thinking" aria-label="Thinking">
+            <span />
+            <span />
+            <span />
+          </div>
+        )}
         {error && <div className="error">{error}</div>}
-        <div ref={bottomRef} />
       </div>
 
       <form
@@ -211,16 +227,22 @@ export default function Page() {
           send(input);
         }}
       >
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask a question…"
-          disabled={busy}
-          autoFocus
-        />
-        <button type="submit" disabled={busy || !input.trim()}>
-          Send
-        </button>
+        <div className="composer-box">
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Ask a question…"
+            disabled={busy}
+            autoFocus
+          />
+          <button type="submit" disabled={busy || !input.trim()}>
+            Send
+          </button>
+        </div>
+        <p className="disclaimer">
+          Answers come from Nawaloka&apos;s hospital database and website. Not
+          medical advice.
+        </p>
       </form>
     </div>
   );
@@ -290,7 +312,7 @@ function MessageMeta({ message }: { message: Message }) {
                 {d.cache.status}
                 {d.cache.tier ? ` (${d.cache.tier}` : ""}
                 {d.cache.score ? `, score ${d.cache.score.toFixed(2)})` : d.cache.tier ? ")" : ""}
-                {d.cache.reason ? ` — ${d.cache.reason}` : ""}
+                {d.cache.reason ? ` - ${d.cache.reason}` : ""}
               </div>
             </div>
           )}
@@ -299,7 +321,7 @@ function MessageMeta({ message }: { message: Message }) {
             <div className="trace-row">
               <div className="label">Safety</div>
               <div>
-                {d.guardrail.verdict} — {d.guardrail.reason}
+                {d.guardrail.verdict} - {d.guardrail.reason}
               </div>
             </div>
           )}

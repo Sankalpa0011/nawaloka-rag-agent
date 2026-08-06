@@ -1,10 +1,4 @@
-"""Shared types for the LLM provider layer.
-
-Providers are wrapped behind our own interface rather than used through a
-framework abstraction, because the failover behaviour - which error is worth
-retrying, which should disable a provider, how usage is reported - is the part
-that has to be trustworthy, and it is provider-specific.
-"""
+"""Shared types for the provider layer: messages, usage, responses, and the error taxonomy."""
 
 from __future__ import annotations
 
@@ -34,6 +28,13 @@ class Usage:
         return self.input_tokens + self.output_tokens
 
 
+#: Finish reasons that mean "cut off", not "done". Gemini stringifies an enum
+#: (``FinishReason.MAX_TOKENS``), Groq and every other OpenAI-compatible API
+#: send ``length``. Matched as substrings because the SDKs disagree on whether
+#: the value arrives as an enum, a bare string, or one wrapped in quotes.
+TRUNCATED_FINISH_REASONS = ("max_tokens", "max_output_tokens", "length")
+
+
 @dataclass
 class LLMResponse:
     text: str
@@ -46,6 +47,12 @@ class LLMResponse:
     usage: Usage = field(default_factory=Usage)
     finish_reason: str = ""
 
+    @property
+    def truncated(self) -> bool:
+        """Whether the model ran out of output budget mid-answer."""
+        reason = (self.finish_reason or "").lower()
+        return any(r in reason for r in TRUNCATED_FINISH_REASONS)
+
     def to_trace(self) -> dict:
         """Compact form for the SSE trace panel."""
         return {
@@ -57,16 +64,11 @@ class LLMResponse:
             "fell_back": self.fell_back,
             "input_tokens": self.usage.input_tokens,
             "output_tokens": self.usage.output_tokens,
+            "finish_reason": self.finish_reason,
         }
 
 
-# ---------------------------------------------------------------------------
-# Errors
-#
-# The distinction that matters is not "did it fail" but "what should we do
-# next": wait and retry the same provider, move to the next one, or stop
-# entirely because no amount of retrying will fix a bad key.
-# ---------------------------------------------------------------------------
+# Errors: classified by what to do next - retry, fail over, or give up.
 class ProviderError(Exception):
     retryable = False
     #: When true the provider is taken out of rotation for the process lifetime.
@@ -106,6 +108,13 @@ class BadRequestError(ProviderError):
     """Malformed request. Failing over will not help - the prompt is the problem."""
 
     retryable = False
+
+
+class ModelUnavailableError(ProviderError):
+    """Model id doesn't exist or isn't callable on this key; other providers can still answer."""
+
+    retryable = False
+    fatal_for_provider = True
 
 
 class AllProvidersFailedError(RuntimeError):

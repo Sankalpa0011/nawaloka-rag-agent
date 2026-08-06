@@ -1,38 +1,28 @@
-"""Hybrid retrieval: dense + BM25 fused server-side, then cross-encoder reranked.
+"""Hybrid search over the scraped site, through LlamaIndex.
 
-Pipeline
---------
-1. Dense (bge-small) and sparse (BM25) searches run as Qdrant *prefetches*, so
-   both happen in a single round trip.
-2. Reciprocal Rank Fusion merges them. RRF is used rather than score-weighted
-   blending because cosine similarity and BM25 scores are not on comparable
-   scales; RRF only needs the ranks.
-3. A cross-encoder reranks the fused candidates. Bi-encoder retrieval scores a
-   query and passage independently; the cross-encoder sees them together and is
-   far better at rejecting topically-adjacent-but-wrong passages.
-4. Anything below the score floor is dropped. If nothing survives, the caller
-   gets an empty list and the agent says it does not know - which is the
-   correct answer far more often than the best of five bad chunks.
+Dense (bge-small) and sparse (BM25) both go to Qdrant in one hybrid query and
+come back fused via LlamaIndex. Reranking uses our own fastembed cross-encoder
+(app/retrieval/rerank.py) rather than LlamaIndex's torch-based one. If nothing
+clears the score floor, the caller gets an empty list and the agent abstains.
 """
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 
-from qdrant_client import models
+from llama_index.core.vector_stores.types import (
+    FilterOperator,
+    MetadataFilter,
+    MetadataFilters,
+)
 
 from app.config import settings
 from app.logging_conf import get_logger
-from app.retrieval.embedder import embed_query, rerank, sparse_query
-from app.retrieval.qdrant_store import DENSE, SPARSE, get_client
+from app.retrieval.rerank import build_reranker
 
 log = get_logger(__name__)
-
-# Characters of chunk body fed to the cross-encoder. ~1200 chars is roughly the
-# model's 512-token window once the breadcrumb is prepended.
-RERANK_DOC_CHARS = 1200
 
 
 @dataclass
@@ -81,38 +71,56 @@ class SearchResult:
         return not self.chunks
 
 
-def _sigmoid(x: float) -> float:
-    """Cross-encoder outputs are logits; squash to 0-1 so the floor is portable."""
-    if x >= 0:
-        return 1.0 / (1.0 + math.exp(-x))
-    e = math.exp(x)
-    return e / (1.0 + e)
+@lru_cache(maxsize=2)
+def get_index(collection: str):
+    """Attach to an existing collection. Indexing lives in qdrant_store.py."""
+    from llama_index.core import VectorStoreIndex
+    from llama_index.vector_stores.qdrant import QdrantVectorStore
+
+    from app.retrieval.embedder import llama_embedding
+    from app.retrieval.qdrant_store import get_client
+
+    store = QdrantVectorStore(
+        client=get_client(),
+        collection_name=collection,
+        enable_hybrid=True,
+        fastembed_sparse_model=settings.sparse_model,
+    )
+    return VectorStoreIndex.from_vector_store(store, embed_model=llama_embedding())
 
 
-def _build_filter(
-    content_types: list[str] | None = None,
-    exclude_content_types: list[str] | None = None,
-    paths: list[str] | None = None,
-) -> models.Filter | None:
-    must: list[models.Condition] = []
-    must_not: list[models.Condition] = []
-
+def _filters(
+    content_types: list[str] | None,
+    exclude_content_types: list[str] | None,
+    paths: list[str] | None,
+) -> MetadataFilters | None:
+    filters = []
     if content_types:
-        must.append(
-            models.FieldCondition(key="content_type", match=models.MatchAny(any=content_types))
-        )
-    if paths:
-        must.append(models.FieldCondition(key="path", match=models.MatchAny(any=paths)))
+        filters.append(MetadataFilter(
+            key="content_type", value=content_types, operator=FilterOperator.IN))
     if exclude_content_types:
-        must_not.append(
-            models.FieldCondition(
-                key="content_type", match=models.MatchAny(any=exclude_content_types)
-            )
-        )
+        filters.append(MetadataFilter(
+            key="content_type", value=exclude_content_types, operator=FilterOperator.NIN))
+    if paths:
+        filters.append(MetadataFilter(key="path", value=paths, operator=FilterOperator.IN))
+    return MetadataFilters(filters=filters) if filters else None
 
-    if not must and not must_not:
-        return None
-    return models.Filter(must=must or None, must_not=must_not or None)
+
+def _to_chunk(node) -> RetrievedChunk:
+    md = node.node.metadata
+    return RetrievedChunk(
+        chunk_id=md.get("chunk_id", node.node.node_id),
+        content=node.node.get_content(),
+        body=md.get("body", ""),
+        url=md.get("url", ""),
+        page_label=md.get("page_label", ""),
+        breadcrumb=md.get("breadcrumb") or [],
+        section_heading=md.get("section_heading", ""),
+        content_type=md.get("content_type", "other"),
+        has_pricing=bool(md.get("has_pricing")),
+        pricing_authority=md.get("pricing_authority", ""),
+        fusion_score=float(node.score or 0.0),
+    )
 
 
 def hybrid_search(
@@ -131,78 +139,43 @@ def hybrid_search(
     use_rerank = settings.enable_rerank if use_rerank is None else use_rerank
     score_floor = settings.retrieval_score_floor if score_floor is None else score_floor
 
-    client = get_client()
-    dense_vec = embed_query(query)
-    sp_idx, sp_val = sparse_query(query)
-
-    response = client.query_points(
-        collection_name=collection,
-        prefetch=[
-            models.Prefetch(
-                query=dense_vec, using=DENSE, limit=settings.retrieval_prefetch_limit
-            ),
-            models.Prefetch(
-                query=models.SparseVector(indices=sp_idx, values=sp_val),
-                using=SPARSE,
-                limit=settings.retrieval_prefetch_limit,
-            ),
-        ],
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
-        limit=settings.retrieval_fusion_limit,
-        with_payload=True,
-        query_filter=_build_filter(content_types, exclude_content_types, paths),
+    retriever = get_index(collection).as_retriever(
+        vector_store_query_mode="hybrid",
+        similarity_top_k=settings.retrieval_fusion_limit,
+        sparse_top_k=settings.retrieval_prefetch_limit,
+        filters=_filters(content_types, exclude_content_types, paths),
     )
+    nodes = retriever.retrieve(query)
 
-    candidates: list[RetrievedChunk] = []
-    for point in response.points:
-        p = point.payload or {}
-        candidates.append(
-            RetrievedChunk(
-                chunk_id=p.get("chunk_id", str(point.id)),
-                content=p.get("content", ""),
-                body=p.get("body", ""),
-                url=p.get("url", ""),
-                page_label=p.get("page_label", ""),
-                breadcrumb=p.get("breadcrumb", []),
-                section_heading=p.get("section_heading", ""),
-                content_type=p.get("content_type", "other"),
-                has_pricing=bool(p.get("has_pricing")),
-                pricing_authority=p.get("pricing_authority", ""),
-                fusion_score=float(point.score),
-            )
-        )
-
-    result = SearchResult(query=query, candidates_considered=len(candidates))
-
-    if not candidates:
+    result = SearchResult(query=query, candidates_considered=len(nodes))
+    if not nodes:
         result.elapsed_ms = int((time.perf_counter() - started) * 1000)
         log.info("search.empty", query=query[:80])
         return result
 
+    # Keep the fusion score before the reranker overwrites it - the trace panel shows both.
+    chunks = [_to_chunk(n) for n in nodes]
+
     if use_rerank:
-        # Score against the breadcrumb + body so the model sees which page a
-        # passage came from, exactly as it was embedded.
-        #
-        # Bodies are truncated to RERANK_DOC_CHARS first. The cross-encoder has
-        # a 512-token limit and truncates internally anyway, so passing full
-        # ~450-token chunks costs CPU without adding signal; the breadcrumb and
-        # opening sentences carry the topicality the reranker is judging.
-        docs = [
-            f"{c.citation}\n{c.body[:RERANK_DOC_CHARS]}" for c in candidates
-        ]
-        scores = rerank(query, docs)
-        for chunk, raw in zip(candidates, scores):
-            chunk.rerank_score = _sigmoid(raw)
-        candidates.sort(key=lambda c: c.rerank_score or 0.0, reverse=True)
+        from llama_index.core.schema import QueryBundle
+
+        reranker = build_reranker(top_k=top_k, score_floor=score_floor)
+        kept = reranker.postprocess_nodes(nodes, QueryBundle(query))
         result.reranked = True
+        result.dropped_below_floor = reranker.dropped
 
-        kept = [c for c in candidates if (c.rerank_score or 0.0) >= score_floor]
-        result.dropped_below_floor = len(candidates) - len(kept)
-        candidates = kept
+        chunks = []
+        for node in kept:
+            chunk = _to_chunk(node)
+            chunk.rerank_score = node.score
+            chunk.fusion_score = float(
+                next((n.score or 0.0) for n in nodes if n.node.node_id == node.node.node_id)
+            )
+            chunks.append(chunk)
 
-    for i, chunk in enumerate(candidates[:top_k], start=1):
+    for i, chunk in enumerate(chunks[:top_k], start=1):
         chunk.rank = i
-    result.chunks = candidates[:top_k]
+    result.chunks = chunks[:top_k]
     result.elapsed_ms = int((time.perf_counter() - started) * 1000)
 
     log.info(
@@ -247,7 +220,7 @@ def main() -> int:
 
     for c in res.chunks:
         rr = f"{c.rerank_score:.3f}" if c.rerank_score is not None else "  -  "
-        print(f"[{c.rank}] rerank={rr}  rrf={c.fusion_score:.4f}  ({c.content_type})")
+        print(f"[{c.rank}] rerank={rr}  hybrid={c.fusion_score:.4f}  ({c.content_type})")
         print(f"    {c.citation}")
         preview = c.body if args.full else c.body[:220].replace("\n", " ")
         print(f"    {preview}\n")

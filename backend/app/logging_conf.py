@@ -1,9 +1,4 @@
-"""Structured logging.
-
-Agent runs are hard to debug from prose logs - you want to grep for an event
-name and read its fields. structlog gives key-value events with almost no
-ceremony, rendered as colourised text locally and as JSON when piped.
-"""
+"""Structured logging via structlog: colourised text locally, JSON when piped."""
 
 from __future__ import annotations
 

@@ -1,25 +1,8 @@
-"""Validation for model-generated SQL.
-
-The agent's SQL tool is the one surface an attacker can reach through prompt
-injection, so generated SQL is parsed and inspected as an **abstract syntax
-tree** before execution - never regex-matched. String matching on "DROP" or
-"DELETE" is trivially defeated (comments, casing, `/*!*/`, string literals
-containing keywords, CTEs wrapping a write), whereas an AST cannot be talked
-out of what it is.
-
-Layers, in order:
-
-1. Parse with sqlglot in the Postgres dialect. Unparseable SQL is rejected.
-2. Exactly one statement - kills `SELECT 1; DROP TABLE doctors`.
-3. The root must be a SELECT (optionally with CTEs) or a set operation.
-4. No write/DDL node anywhere in the tree, at any depth.
-5. Every referenced table must be on the allowlist.
-6. No system catalogues, no server-side file access functions.
-7. A LIMIT is injected or clamped by rewriting the AST, not by string
-   concatenation.
-
-This is defence in depth, not the only defence: the connection role itself
-cannot write (db/init/004_ro_role.sh).
+"""Validates model-generated SQL via an AST (sqlglot), not regex - a string
+match for "DROP"/"DELETE" is trivially bypassed with comments, casing, or a
+CTE. Checks in order: parses; single statement; SELECT-only root; no write/DDL
+node anywhere; table allowlist; no system catalogues/dangerous functions;
+LIMIT clamped by rewriting the AST. Defense in depth - the DB role can't write either.
 """
 
 from __future__ import annotations
@@ -37,9 +20,7 @@ log = get_logger(__name__)
 
 DIALECT = "postgres"
 
-# Tables and views the agent may read. Note routing_decisions and user_memory
-# are absent: they hold conversation content, and the database role denies them
-# too.
+# Tables/views the agent may read; routing_decisions and user_memory are deliberately absent.
 ALLOWED_RELATIONS: frozenset[str] = frozenset(
     {
         "specialties",
@@ -135,13 +116,13 @@ def validate_sql(sql: str, max_rows: int = MAX_ROWS) -> GuardResult:
 
     tree = statements[0]
 
-    # --- 3. must be a read ---------------------------------------------------
+    # must be a read 
     if not isinstance(tree, (exp.Select, exp.Union, exp.Except, exp.Intersect, exp.Subquery)):
         raise SqlGuardError(
             f"only SELECT statements are permitted, got {type(tree).__name__.upper()}"
         )
 
-    # --- 4. no write or DDL node, at any depth -------------------------------
+    # no write or DDL node, at any depth 
     for node_type in FORBIDDEN_NODES:
         found = tree.find(node_type)
         if found is not None:
@@ -156,21 +137,24 @@ def validate_sql(sql: str, max_rows: int = MAX_ROWS) -> GuardResult:
     if tree.find(exp.Lock) is not None:
         raise SqlGuardError("locking clauses are not permitted")
 
-    # --- 6a. no system catalogues -------------------------------------------
+    # no system catalogues 
     if FORBIDDEN_SCHEMA_RE.search(sql):
         raise SqlGuardError("access to system catalogues is not permitted")
 
-    # --- 6b. no dangerous functions -----------------------------------------
+    # no dangerous functions 
     for fn in tree.find_all(exp.Anonymous):
         name = (fn.this or "").lower() if isinstance(fn.this, str) else ""
         if name in FORBIDDEN_FUNCTIONS:
             raise SqlGuardError(f"function {name}() is not permitted")
+
+    # Belt and braces: also regex the raw text, since sqlglot doesn't always
+    # parse these as Anonymous nodes.
     lowered = sql.lower()
     for fn in FORBIDDEN_FUNCTIONS:
         if re.search(rf"\b{re.escape(fn)}\s*\(", lowered):
             raise SqlGuardError(f"function {fn}() is not permitted")
 
-    # --- 5. table allowlist --------------------------------------------------
+    #  table allowlist 
     tables, ctes = _relation_names(tree)
     unknown = sorted(t for t in tables if t not in ALLOWED_RELATIONS and t not in ctes)
     if unknown:
@@ -181,7 +165,7 @@ def validate_sql(sql: str, max_rows: int = MAX_ROWS) -> GuardResult:
             + ", ".join(sorted(ALLOWED_RELATIONS))
         )
 
-    # --- 7. clamp LIMIT by rewriting the tree --------------------------------
+    #clamp LIMIT by rewriting the tree 
     limit_applied: int | None = None
     if isinstance(tree, exp.Select):
         existing = tree.args.get("limit")

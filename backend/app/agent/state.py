@@ -1,13 +1,7 @@
-"""Shared state for the agent graph.
+"""Shared TypedDict state passed between agent graph nodes.
 
-Two things are deliberate here:
-
-* SQL evidence and vector evidence live in **separate keys**. That is what makes
-  the HYBRID fan-out safe - the two branches run concurrently and never write
-  the same field, so no reducer or locking is needed.
-* Everything needed to explain a turn (route, rationale, SQL executed, chunks
-  with scores, which provider served it) is kept on the state rather than
-  logged and discarded, because the UI renders it as a trace panel.
+SQL and vector evidence live in separate keys so the HYBRID fan-out has no
+reducer conflicts, and enough of each turn is kept on state to drive the UI trace panel.
 """
 
 from __future__ import annotations
@@ -16,7 +10,8 @@ import operator
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, TypedDict
 
-Route = Literal["SQL", "VECTOR", "HYBRID", "SMALLTALK", "OUT_OF_SCOPE",
+# Every route a turn can end up on, including the FAQ fast-path.
+Route = Literal["SQL", "VECTOR", "HYBRID", "FAQ", "SMALLTALK", "OUT_OF_SCOPE",
                 "EMERGENCY", "REFUSE"]
 
 
@@ -41,39 +36,57 @@ class Citation:
 
 
 class AgentState(TypedDict, total=False):
-    # --- identity / input -------------------------------------------------
+    # identity / input 
     thread_id: str
     user_query: str
     contextual_query: str          # coreference-resolved; used for routing
     history: list[list[str]]       # [[user, assistant], ...]
 
-    # --- routing ----------------------------------------------------------
-    route: str
+    # routing 
+    route: Route
     route_decision: dict           # full RouteDecision.to_dict()
     sql_intent: str
     vector_intent: str
 
-    # --- guardrail --------------------------------------------------------
+    # guardrail 
     guardrail: dict
     disclaimer_required: bool
 
-    # --- evidence (written by independent branches) -----------------------
+    #  evidence (written by independent branches) 
     sql_calls: Annotated[list[dict], operator.add]
     documents: list[dict]
     retrieval: dict
 
-    # --- memory -----------------------------------------------------------
+    # SQL self-correction 
+    # Plain keys, not reducers: each retry pass overwrites; clearing last_error ends the cycle.
+    sql_attempts: int
+    last_error: str
+    # Every error so far, shown to the model so it stops repeating itself.
+    tool_feedback: list[str]
+    # Set when a tool ran fine but matched nothing under applied filters; triggers one retry.
+    empty_with_filters: str
+    # Subject that retry failed to find, carried forward so a later broadened match isn't mistaken for a hit.
+    unmatched_subject: str
+
+    # zero-row outcome 
+    zero_rows: bool
+    #{"tool": str, "filters": dict, "subject": str}; empty when zero_rows is False.
+    zero_row_context: dict
+    # Set once the SQL -> vector fallback has run, so it fires at most once per turn.
+    vector_fallback_used: bool
+
+    # memory 
     memory: dict
 
-    # --- FAQ / cache ------------------------------------------------------
+    # FAQ / cache 
     cache: dict
 
-    # --- output -----------------------------------------------------------
+    # output 
     answer: str
     citations: list[dict]
     abstained: bool
 
-    # --- observability ----------------------------------------------------
+    # observability 
     trace: Annotated[list[dict], operator.add]
     llm_calls: Annotated[list[dict], operator.add]
     error: str

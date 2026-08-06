@@ -1,0 +1,145 @@
+# Symptom -> specialty navigation. NOT diagnosis.
+#
+# This maps how a patient describes a problem onto the clinic that normally
+# sees it. It never asserts a cause, and the guardrail adds the "this is not a
+# diagnosis" wording to anything built from it.
+#
+# `specialty` values are checked against the specialties table when this file
+# loads, so a rename in the database fails loudly at startup instead of quietly
+# returning zero rows. Add a specialty here only if it exists there.
+#
+# Phrasings are embedded and matched semantically, so this doesn't need every
+# possible wording - "my chest feels tight" finds "chest pain" on its own.
+# Include the lay terms people actually use rather than clinical vocabulary.
+#
+# `aliases` are what patients call the PRACTITIONER rather than the problem -
+# "cardiologist", "ear nose throat", "gp". They are matched literally, not
+# embedded, and they feed the routing gazetteer in agent/signals.py. They live
+# here rather than in code because the previous in-code table was keyed on exact
+# lowercased specialty names: rename a specialty in the database and the lookup
+# silently stopped matching, with nothing failing. Here they get the same
+# validation the specialty names above get, so the same rename fails at startup.
+#
+# Only irregular forms need listing. Regular ones are derived by suffix
+# (-ology -> -ologist, -surgery -> -surgeon), so "Cardiology" already yields
+# "cardiologist" without an entry.
+
+- specialty: Cardiology
+  aliases: [heart doctor]
+  symptoms:
+    - chest pain
+    - chest tightness
+    - palpitations
+    - irregular heartbeat
+    - heart problem
+    - breathlessness on exertion
+    - high cholesterol
+
+- specialty: Neurosurgery
+  aliases: [neurosurgeon, neurologist, brain surgeon]
+  symptoms:
+    - headache
+    - migraine
+    - seizure
+    - fits
+    - nerve pain
+    - numbness
+    - tingling in hands or feet
+    - brain problem
+    - spine problem
+    - slipped disc
+    - paralysis
+    - stroke recovery
+    - memory loss
+
+- specialty: ENT Surgery
+  aliases: [ent, ent surgeon, otolaryngologist, ear nose throat]
+  symptoms:
+    - ear pain
+    - ear discharge
+    - hearing loss
+    - blocked nose
+    - sinus problem
+    - sore throat
+    - tonsils
+    - snoring
+    - voice hoarseness
+    - dizziness and vertigo
+
+- specialty: Respiratory & Chest Medicine
+  aliases: [pulmonologist, chest physician, chest specialist]
+  symptoms:
+    - cough
+    - persistent cough
+    - shortness of breath
+    - wheezing
+    - asthma
+    - chest infection
+    - smoking related breathing problems
+
+- specialty: General Surgery & Gastroenterology
+  aliases: [gastroenterologist, surgeon, gastro]
+  symptoms:
+    - stomach pain
+    - abdominal pain
+    - indigestion
+    - acid reflux
+    - heartburn
+    - constipation
+    - diarrhoea
+    - blood in stool
+    - hernia
+    - gallstones
+    - piles
+
+- specialty: Paediatrics
+  aliases: [paediatrician, pediatrician, pediatrics, child doctor]
+  symptoms:
+    - child is unwell
+    - baby not feeding
+    - infant fever
+    - child vaccination
+    - childhood growth concerns
+
+- specialty: Rheumatology & Sports Medicine
+  aliases: [rheumatologist, sports medicine]
+  symptoms:
+    - joint pain
+    - knee pain
+    - arthritis
+    - back pain
+    - shoulder pain
+    - sports injury
+    - muscle pain
+    - swollen joints
+
+- specialty: Radiology & Imaging
+  aliases: [radiologist, imaging, scan, x-ray, mri]
+  symptoms:
+    - need a scan
+    - x-ray
+    - mri scan
+    - ct scan
+    - ultrasound scan
+
+- specialty: General Medicine
+  aliases: [physician, general physician, gp]
+  symptoms:
+    - fever
+    - common cold
+    - flu
+    - body aches
+    - fatigue
+    - tiredness
+    - dizziness
+    - weight loss
+    - diabetes
+    - high blood pressure
+    - thyroid problem
+    - general check up
+    - not feeling well
+
+# Alias-only: this clinic takes no direct patient complaints (it is theatre and
+# ICU cover), but patients do name its practitioners.
+- specialty: Cardiac Anaesthesia & Critical Care
+  aliases: [anaesthetist, anesthesiologist, intensivist]

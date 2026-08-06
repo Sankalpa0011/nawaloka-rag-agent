@@ -1,100 +1,43 @@
-"""SQL branch: choose a curated tool, or fall back to guarded Text-to-SQL.
-
-Tool selection is itself an LLM call with schema-constrained output, but the
-*space* it chooses from is small and every option is safe. That is the point of
-the hybrid design: the model picks which question to ask, not how to ask it.
-Only when no curated tool fits does generated SQL come into play, and that path
-is still validated by the AST guard and executed read-only.
-"""
+"""SQL branch: pick a curated tool via LLM, or fall back to guarded Text-to-SQL."""
 
 from __future__ import annotations
 
+import re
 import time
 from functools import lru_cache
 from typing import Any
 
 from app.agent.state import AgentState, trace_event
 from app.config import settings
-from app.llm.base import Msg
 from app.llm.router import get_router
 from app.logging_conf import get_logger
+from app.prompts.templates import TOOL_CHOICE, render
+from pydantic import ValidationError
+
+from app.tools import schemas as tool_schemas
 from app.tools import sql_tools
+from app.tools.schemas import TOOL_ARGS
 from app.tools.sql_tools import SqlToolResult
 
 log = get_logger(__name__)
 
+TEXT2SQL = "text2sql"
+
+TOOL_NAMES: tuple[str, ...] = (*tool_schemas.tool_names(), TEXT2SQL)
+
 TOOL_SCHEMA = {
     "type": "object",
     "properties": {
-        "tool": {
-            "type": "string",
-            "enum": [
-                "find_doctors",
-                "get_doctor_schedule",
-                "search_lab_tests",
-                "search_health_packages",
-                "list_specialties",
-                "suggest_specialty",
-                "text2sql",
-            ],
-        },
+        "tool": {"type": "string", "enum": list(TOOL_NAMES)},
         "arguments": {"type": "object"},
         "reason": {"type": "string"},
     },
     "required": ["tool", "arguments"],
 }
 
-TOOL_PROMPT = """Pick ONE tool to answer a hospital database question. JSON only.
-
-find_doctors            {specialty?, name?, department?, weekday?, max_fee?, include_schedule?}
-                        doctor lists, fees, who is available on a day
-get_doctor_schedule     {doctor}                 one named doctor's channeling times
-search_lab_tests        {query?, category?, max_price?, fasting_required?, max_report_hours?}
-                        lab test prices, fasting rules, report turnaround
-search_health_packages  {query?, includes_service?, max_price?, target_audience?, category?}
-                        packages; use includes_service to search INSIDE package contents
-list_specialties        {}                       all specialties and departments
-suggest_specialty       {complaint}              map a symptom to the right clinic
-text2sql                {question}               ONLY if no tool above fits
-                        (aggregates, counts, averages, superlatives across tables)
-
-Every tool ALWAYS returns full details (fees, prices, schedules) for whatever it
-finds. Arguments are FILTERS that narrow the search - they are never requests
-for a field.
-
-  max_fee / max_price / max_report_hours   a NUMBER: keep only results at or
-                                           below it. Never true/false.
-  fasting_required / include_schedule      true or false
-  everything else                          text to match
-
-So "what is Dr X's fee?" is {"name": "Dr X"} - NOT {"name": "Dr X",
-"max_fee": true}. Asking for a fee is not a filter on the fee.
-
-Every row already belongs to Nawaloka Hospitals, so "Nawaloka", "the hospital"
-or "all" is never a filter value. "Which doctors practise here?" is
-find_doctors with NO arguments - it returns the whole directory.
-
-A symptom in the patient's own words is NOT a specialty. "neuron issue",
-"chest pain", "my mother's stomach problem" -> suggest_specialty with the
-complaint. Only pass `specialty` when the question names an actual medical
-discipline.
-
-Rules:
-- weekday must be a weekday name; the tool handles doctors recorded as 'Daily'
-- "which package includes X" -> search_health_packages with includes_service: X
-- omit arguments you do not need; never invent argument names
-- prefer a curated tool; text2sql is the last resort"""
-
 
 @lru_cache(maxsize=1)
 def _specialty_roster() -> str:
-    """The specialties that actually exist, for the tool-choice prompt.
-
-    Without it the model guesses from the question's wording: "i need a heart
-    surgery doctor" became ``find_doctors(specialty="General Surgery &
-    Gastroenterology")``, which returned a real doctor for the wrong problem.
-    Read from the table so it cannot drift, and cached because it is per-turn.
-    """
     try:
         from app.tools.db import fetch
 
@@ -105,161 +48,160 @@ def _specialty_roster() -> str:
         return ""
 
 
-def _tool_prompt() -> str:
-    roster = _specialty_roster()
-    if not roster:
-        return TOOL_PROMPT
-    return (
-        f"{TOOL_PROMPT}\n\nThe only specialties that exist here are: {roster}.\n"
-        "If the question does not name one of these, do not pick the nearest - "
-        "it is a complaint, so use suggest_specialty."
-    )
+async def _choose_tool(
+    question: str, feedback: list[str] | None = None
+) -> tuple[str, dict, str, str]:
 
+    user = f"Question: {question}"
+    if feedback:
+        problems = "\n".join(f"- {f}" for f in feedback)
+        user = (
+            f"{user}\n\nYour previous attempt(s) failed:\n{problems}\n\n"
+            "Fix the call. Do not repeat the same mistake."
+        )
 
-async def _choose_tool(question: str) -> tuple[str, dict, str, str]:
-    """Returns (tool_name, arguments, reason, provider)."""
     data, response = await get_router().complete_json(
-        [Msg("system", _tool_prompt()), Msg("user", f"Question: {question}")],
+        render(TOOL_CHOICE, roster=_specialty_roster(), input=user),
         TOOL_SCHEMA,
         tier="fast",
-        max_tokens=400,
+        max_tokens=settings.sql_tool_choice_max_tokens,
     )
     tool = str(data.get("tool", "")).strip()
     args = data.get("arguments") or {}
     if not isinstance(args, dict):
         args = {}
-    return tool, args, str(data.get("reason", ""))[:200], response.provider
+    reason = str(data.get("reason", ""))[: settings.sql_tool_reason_max_chars]
+    return tool, args, reason, response.provider
 
 
-#: Parameters that filter on a number. A boolean here is always a mistake.
-_NUMERIC_ARGS = {"max_fee", "max_price", "max_report_hours", "limit"}
-#: Parameters that are genuinely true/false switches.
-_BOOLEAN_ARGS = {"include_schedule", "fasting_required"}
+def _validate_args(tool: str, args: dict[str, Any]) -> dict[str, Any]:
 
-#: Text filter values that cannot narrow anything, so passing one can only
-#: destroy a result set.
-#:
-#: The observed failure was ``find_doctors(department="Nawaloka Hospitals")``
-#: for "which doctors practise here?" - the model read the institution from the
-#: question and filed it as a filter, producing
-#: ``department ILIKE '%Nawaloka Hospitals%'``, zero rows, and a flatly
-#: confident "I do not have that information" about a directory of eleven
-#: doctors. Every value here means "no filter", so dropping it is always
-#: closer to the user's intent than applying it.
-_STOP_FILTER_VALUES = {
-    # The hospital's own name. Every row in the database belongs to it, so it
-    # is never a discriminating value for any column.
-    "nawaloka", "nawaloka hospital", "nawaloka hospitals",
-    "nawaloka hospitals plc", "nawaloka hospital plc",
-    "hospital", "the hospital", "this hospital",
-    # Placeholders a model reaches for when the schema wants a value it does
-    # not have.
-    "all", "any", "*", "none", "null", "n/a", "na", "nil",
-    "unknown", "unspecified", "everything", "everyone",
-    "all departments", "any department", "all specialties", "any specialty",
-    "all doctors", "all tests", "all packages",
-}
+    schema = TOOL_ARGS.get(tool)
+    if schema is None:
+        raise KeyError(tool)
 
-
-def _normalise_value(value: Any) -> str:
-    return " ".join(str(value).lower().split()).strip(" .,'\"")
-
-
-def _coerce_args(args: dict[str, Any], accepted: set[str]) -> tuple[dict, list[str]]:
-    """Validate argument types, dropping values that cannot mean what they say.
-
-    Models routinely pass a *flag* where a *filter value* is expected - the
-    observed failure was ``max_fee: true`` for "what is Dr X's fee?", meaning
-    "yes, I want the fee". Coerced naively that becomes ``fee <= 1.0``, which
-    returns nothing and the agent then reports, with total confidence, that the
-    doctor does not exist. Dropping the bad filter degrades to a broader query,
-    which is recoverable; keeping it produces a wrong answer, which is not.
-    """
-    cleaned: dict[str, Any] = {}
-    problems: list[str] = []
-
+    supplied = {}
     for key, value in args.items():
-        if key not in accepted:
-            problems.append(f"{key} (not a parameter of this tool)")
-            continue
         if value is None or value == "":
             continue
+        supplied[key] = value
 
-        if key in _NUMERIC_ARGS:
-            if isinstance(value, bool):
-                problems.append(f"{key}={value} (expected a number, not true/false)")
-                continue
-            try:
-                cleaned[key] = float(value)
-            except (TypeError, ValueError):
-                problems.append(f"{key}={value!r} (not a number)")
+    validated = schema(**supplied)
+    return validated.model_dump(exclude_none=True)
+
+
+def _validation_detail(exc: ValidationError) -> str:
+    """One readable line per rejected argument, for the model to act on."""
+    parts = []
+    for err in exc.errors():
+        field = ".".join(str(p) for p in err.get("loc", ())) or "argument"
+        parts.append(f"{field}: {err.get('msg', 'invalid')}")
+    return "; ".join(parts)
+
+
+def _applied(args: dict[str, Any]) -> dict[str, Any]:
+    """Arguments that actually narrowed the search."""
+    return {k: v for k, v in args.items() if v not in (None, "", False)}
+
+
+def _recognised(value: str) -> bool:
+    """Does the gazetteer or the symptom ontology know what this phrase refers
+    to? Returns False on outage rather than raising."""
+    text = (value or "").strip()
+    if not text:
+        return False
+
+    try:
+        from app.agent.signals import extract_signals
+
+        if extract_signals(text).entities:
+            return True
+    except Exception as exc:
+        log.warning("sql_agent.gazetteer_unavailable", error=str(exc)[:160])
+
+    try:
+        from app.retrieval.ontology import match_specialties
+
+        return bool(match_specialties(text))
+    except Exception as exc:
+        log.warning("sql_agent.ontology_unavailable", error=str(exc)[:160])
+        return False
+
+
+def _names_something_specific(value: str) -> bool:
+    """Whether this phrase points at a particular record vs. a whole topic."""
+    text = (value or "").strip().lower()
+    if not text:
+        return False
+
+    try:
+        from app.agent import signals
+
+        generic = (
+            signals.build_gazetteer().shared_words
+            | signals.SQL_KEYWORDS
+            | signals.RECORD_NOUNS
+            | signals.VECTOR_KEYWORDS
+            | signals._STOPWORDS
+        )
+    except Exception as exc:
+        log.warning("sql_agent.vocabulary_unavailable", error=str(exc)[:160])
+        return True
+
+    for word in re.findall(r"[a-z][a-z'-]{2,}", text):
+        if word in generic or word.rstrip("s") in generic or f"{word}s" in generic:
             continue
-
-        if key in _BOOLEAN_ARGS:
-            if isinstance(value, bool):
-                cleaned[key] = value
-            elif isinstance(value, str) and value.lower() in ("true", "false", "yes", "no"):
-                cleaned[key] = value.lower() in ("true", "yes")
-            else:
-                problems.append(f"{key}={value!r} (expected true/false)")
-            continue
-
-        # Everything else is free text.
-        text = value if isinstance(value, str) else str(value)
-        if _normalise_value(text) in _STOP_FILTER_VALUES:
-            problems.append(f"{key}={text!r} (matches every row, so it filters nothing)")
-            continue
-        cleaned[key] = text
-
-    return cleaned, problems
+        return True
+    return False
 
 
-#: Arguments that may accompany a specialty without making a zero-row result
-#: meaningful. A weekday or fee filter can legitimately empty a result set
-#: ("no cardiologist on Sunday"), and re-reading the query as a complaint would
-#: silently drop that constraint.
-_COMPLAINT_RETRY_ARGS = {"specialty", "department", "name", "include_schedule", "limit"}
-
-
-def _complaint_subject(cleaned: dict[str, Any]) -> str | None:
-    """The argument value worth re-reading as a complaint, if any."""
-    for key in ("specialty", "department"):
-        if cleaned.get(key):
-            return str(cleaned[key])
-
-    # A name is different in kind. A genuine name matching nothing means that
-    # doctor does not work here, and saying so is the correct answer - so this
-    # only fires when the value is plainly a symptom. Observed:
-    # ``find_doctors(name="fever")``, which reported no such doctor.
-    name = cleaned.get("name")
-    if name and sql_tools.looks_like_complaint(str(name)):
-        return str(name)
+# which argument (if any) names the thing the patient asked about
+def _complaint_subject(tool: str, cleaned: dict[str, Any]) -> str | None:
+    for field in tool_schemas.fields_with_role(tool, "subject"):
+        if cleaned.get(field):
+            return str(cleaned[field])
     return None
 
 
-def _retry_as_complaint(specialty: str) -> SqlToolResult:
-    """Re-read a specialty that matched nothing as a description of the problem.
+def _only_subject_args(tool: str, cleaned: dict[str, Any]) -> bool:
+    """Whether the empty result is explained purely by the named subject, with no other constraint applied."""
+    constraints = set(tool_schemas.fields_with_role(tool, "constraint"))
+    return not (constraints & set(_applied(cleaned)))
 
-    Patients name the problem, not the discipline: "my mother got neuron issue,
-    who is the doctor I need to contact?" was filed as
-    ``find_doctors(specialty="neuron issues")``, which matched no specialty and
-    dead-ended on "our database does not have any records" - to a question with
-    a perfectly good answer. ``suggest_specialty`` exists for exactly this and
-    never returns nothing, falling back to General Medicine as a starting point.
 
-    Recovering here rather than in the prompt makes it deterministic: the model
-    only has to reach the doctor table, not to have classified the phrasing
-    correctly first.
-    """
-    result = sql_tools.suggest_specialty(specialty)
+def _substituted_note(subject: str) -> str:
+    return (
+        f"IMPORTANT: nothing in the database matched '{subject}'. The rows below are "
+        "what is available instead, NOT an answer to what was asked. Tell the patient "
+        "plainly first that Nawaloka Hospitals does not have what they asked for, then "
+        "offer these as the closest alternatives. Never present them as if they matched."
+    )
+
+
+def _retry_as_complaint(subject: str) -> SqlToolResult | None:
+    """Re-read an unmatched value as a symptom via the ontology; None if nothing matches."""
+    try:
+        from app.retrieval.ontology import match_specialties
+
+        matched = match_specialties(subject)
+    except Exception as exc:
+
+        log.warning("sql_agent.ontology_unavailable", error=str(exc)[:160])
+        return None
+
+    if not matched:
+        log.info("sql_agent.no_ontology_match", subject=subject[:60])
+        return None
+
+    result = sql_tools.suggest_specialty(subject, matched=matched)
     result.notes.insert(
         0,
-        f"'{specialty}' is not a specialty in the database, so it was re-read as a "
+        f"'{subject}' is not a specialty in the database, so it was re-read as a "
         "description of the problem. Answer the question that was asked - do not "
         "mention the failed lookup, and do not present this as a diagnosis.",
     )
-    log.info("sql_agent.retried_as_complaint", specialty=specialty[:60],
-             rows=result.row_count)
+    log.info("sql_agent.retried_as_complaint", subject=subject[:60],
+             specialties=matched, rows=result.row_count)
     return result
 
 
@@ -268,41 +210,103 @@ def _call_curated(tool: str, args: dict[str, Any]) -> SqlToolResult:
     if fn is None:
         raise KeyError(tool)
 
-    import inspect
-
-    accepted = set(inspect.signature(fn).parameters)
-    cleaned, problems = _coerce_args(args, accepted)
+    try:
+        cleaned = _validate_args(tool, args)
+    except ValidationError as exc:
+        symptom = tool_schemas.complaint_value(exc)
+        if symptom is None:
+            raise
+        recovered = _retry_as_complaint(symptom)
+        if recovered is None:
+            raise
+        return recovered
 
     result = fn(**cleaned)
 
-    subject = _complaint_subject(cleaned)
+    result.requested_filters = dict(cleaned)
+
+    subject = _complaint_subject(tool, cleaned)
     if (
-        tool == "find_doctors"
-        and not result.error
+        not result.error
         and result.row_count == 0
         and subject
-        and set(cleaned) <= _COMPLAINT_RETRY_ARGS
+        and _only_subject_args(tool, cleaned)
     ):
-        result = _retry_as_complaint(str(subject))
+        recovered = _retry_as_complaint(subject)
+        if recovered is not None:
+            result = recovered
 
-    if problems:
-        log.warning("sql_agent.bad_arguments", tool=tool, problems=problems)
-        result.notes.append("Ignored invalid argument(s): " + "; ".join(problems))
     return result
 
 
+MAX_SQL_ATTEMPTS = settings.sql_max_attempts
+
+
+def _empty_with_filters(
+    result: SqlToolResult, tool: str, args: dict[str, Any], attempt: int
+) -> tuple[str, str]:
+    """Whether an empty filtered result is worth retrying broader; returns (instruction, subject)."""
+    if (
+        result.error
+        or result.row_count
+        or result.relaxed
+        or attempt > settings.sql_broaden_max_attempt
+    ):
+        return "", ""
+
+    applied = {k: v for k, v in _applied(args).items() if k != "limit"}
+    if not applied:
+        return "", ""
+
+    subject = next(
+        (applied[f] for f in tool_schemas.fields_with_role(tool, "subject")
+         if f in applied),
+        None,
+    )
+    if subject is None:
+        values = list(applied.values())
+        subject = next((v for v in values if isinstance(v, str)), values[0])
+    subject = str(subject)
+
+    if _names_something_specific(subject) and not _recognised(subject):
+        log.info("sql_agent.no_broadening", tool=tool, subject=subject[:60],
+                 reason="names a specific record unknown to the database and the ontology")
+        return "", subject
+
+
+    if tool_schemas.has_required_args(tool):
+        needed = ", ".join(tool_schemas.required_fields(tool))
+        retry = (f"a different tool - {tool} cannot run without {needed}, and the "
+                 f"patient named no {needed}")
+    else:
+        retry = f"{tool} with NO arguments at all"
+    instruction = (
+        f"{tool}({applied}) ran fine and matched nothing, so those filters are "
+        f"wrong. The patient did not name a specific record - they named a topic. "
+        f"Do NOT justify the filters and do NOT adjust them. Call {retry}, and let "
+        "the full list come back."
+    )
+    return instruction, subject
+
+
 async def sql_agent_node(state: AgentState) -> dict:
+    """Pick a tool and run it; failures come back as state so the graph can retry."""
     started = time.perf_counter()
     question = state.get("sql_intent") or state.get("contextual_query") or state["user_query"]
+    attempt = state.get("sql_attempts", 0) + 1
+    feedback = list(state.get("tool_feedback") or [])
 
     try:
-        tool, args, reason, provider = await _choose_tool(question)
+        tool, args, reason, provider = await _choose_tool(question, feedback)
     except Exception as exc:
         log.warning("sql_agent.tool_choice_failed", error=str(exc)[:200])
-        # Without a choice, the broadest useful default is the doctor directory.
-        tool, args, reason, provider = "find_doctors", {}, "tool choice failed", ""
-
-    log.info("sql_agent.tool_chosen", tool=tool, args=args, provider=provider)
+        tool = "text2sql"
+        args = {"question": question}
+        reason = "dynamic text2sql fallback due to tool choice failure"
+        provider = "system-dynamic"
+        
+    log.info("sql_agent.tool_chosen", tool=tool, args=args, provider=provider,
+             attempt=attempt)
 
     if tool == "text2sql" or tool not in sql_tools.TOOLS:
         if not settings.enable_text2sql_fallback:
@@ -311,29 +315,89 @@ async def sql_agent_node(state: AgentState) -> dict:
         else:
             from app.tools.text2sql import generate_and_run
 
-            t2s = await generate_and_run(args.get("question") or question)
+            t2s = await generate_and_run(args.get("question") or question,
+                                         feedback=feedback)
             result = t2s.to_tool_result()
             reason = reason or t2s.explanation
     else:
         try:
             result = _call_curated(tool, args)
+        except ValidationError as exc:
+            detail = _validation_detail(exc)
+            log.warning("sql_agent.invalid_arguments", tool=tool, detail=detail,
+                        attempt=attempt)
+            result = SqlToolResult(
+                tool=tool, error=f"{tool}({args}) rejected - {detail}"
+            )
         except Exception as exc:
             log.warning("sql_agent.tool_failed", tool=tool, error=str(exc)[:200])
             result = SqlToolResult(tool=tool, error=f"{type(exc).__name__}: {exc}")
 
+
+    carried = state.get("unmatched_subject") or ""
+    if carried and result.rows and not result.error:
+        result.relaxed = True
+        result.notes.insert(0, _substituted_note(carried))
+
     payload = result.to_dict()
     payload["chosen_because"] = reason
+    payload["attempt"] = attempt
     payload["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
 
-    return {
+    instruction, subject = _empty_with_filters(result, tool, args, attempt)
+
+    zero_rows = bool(not result.error and result.row_count == 0 and not result.relaxed)
+
+    out: dict = {
         "sql_calls": [payload],
-        "trace": [
-            trace_event(
-                "sql_agent",
-                tool=result.tool,
-                rows=result.row_count,
-                ms=payload["elapsed_ms"],
-                error=result.error,
-            )
-        ],
+        "sql_attempts": attempt,
+        "last_error": result.error or "",
+        "empty_with_filters": instruction,
+        # Set for the retry to pick up, cleared once this pass has used it.
+        "unmatched_subject": subject,
+        "zero_rows": zero_rows,
+        "zero_row_context": {
+            "tool": result.tool,
+            "filters": dict(result.requested_filters),
+            "subject": subject
+            or _complaint_subject(result.tool, result.requested_filters)
+            or carried,
+        } if zero_rows else {},
     }
+
+    if instruction:
+        feedback.append(instruction)
+        out["tool_feedback"] = feedback
+        log.info("sql_agent.empty_retrying", tool=tool, args=args, subject=subject[:60])
+
+    if result.error:
+        feedback.append(result.error)
+        out["tool_feedback"] = feedback
+        exhausted = attempt >= settings.sql_max_attempts
+        if exhausted:
+            result.notes.append(
+                "The database lookup failed and could not be corrected. Tell the "
+                "user you were unable to look this up - do not guess an answer."
+            )
+            payload["notes"] = result.notes
+        log.warning("sql_agent.failed", attempt=attempt, exhausted=exhausted,
+                    error=result.error[:160])
+
+    out["trace"] = [
+        trace_event(
+            "sql_agent",
+            tool=result.tool,
+            rows=result.row_count,
+            attempt=attempt,
+            ms=payload["elapsed_ms"],
+            error=result.error,
+            zero_rows=zero_rows,
+        )
+    ]
+    return out
+
+
+def sql_found_nothing(state: AgentState) -> bool:
+    """Whether every SQL call this turn (not just the last) came back with no rows."""
+    calls = state.get("sql_calls") or []
+    return bool(calls) and not any(c.get("rows") for c in calls)

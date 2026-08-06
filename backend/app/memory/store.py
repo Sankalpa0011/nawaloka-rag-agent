@@ -1,23 +1,7 @@
-"""Conversation memory, persisted in Postgres.
+"""Conversation memory, stored in Postgres: turn history, thread state
+(summary + focus slots), and cross-session user memory.
 
-Three layers, each with a different lifetime:
-
-**Turn history** - the literal exchange, per thread. Bounded when injected: the
-last few turns go into prompts, never the whole transcript.
-
-**Thread state** - a rolling summary plus `focus_entities`, the explicit slots
-tracking what the conversation is currently *about* (which doctor, which test,
-which weekday). Slots are what make "and what is his fee?" resolvable; asking a
-model to find the referent in raw history is far less reliable, and costs a
-call every turn.
-
-**User memory** - survives across sessions, and is written through a strict
-allowlist. Symptoms and health conditions are deliberately never persisted:
-that is identifiable health data, and a chatbot has no business keeping it.
-
-The tables are created on demand rather than in db/init, because those scripts
-only run when the Postgres volume is first initialised - a schema change would
-otherwise silently not apply to an existing database.
+Schema created on demand, mirroring db/init for databases that already exist.
 """
 
 from __future__ import annotations
@@ -28,13 +12,13 @@ from typing import Any
 
 from sqlalchemy import text
 
+from app.config import settings
 from app.logging_conf import get_logger
 from app.tools.db import owner_engine
 
 log = get_logger(__name__)
 
-#: Cross-session keys that may be persisted. Anything not listed is dropped.
-#: Deliberately excludes symptoms, conditions, medications and test results.
+# Keys allowed to survive a session - no symptoms, conditions, medications or test results.
 USER_MEMORY_ALLOWLIST = frozenset({
     "preferred_language",
     "preferred_specialty",
@@ -43,10 +27,10 @@ USER_MEMORY_ALLOWLIST = frozenset({
     "preferred_weekday",
 })
 
-#: Entity slots carried between turns.
+# entity slots we carry from one turn to the next
 FOCUS_SLOTS = ("doctor", "specialty", "lab_test", "package", "weekday")
 
-MAX_HISTORY_TURNS = 20
+MAX_HISTORY_TURNS = settings.memory_max_history_turns
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS thread_messages (
@@ -92,15 +76,15 @@ class ThreadState:
     focus_entities: dict[str, str] = field(default_factory=dict)
     turn_count: int = 0
 
+    # formatted for a prompt, empty string if nothing is in focus
     def focus_block(self) -> str:
-        """Rendered for prompts. Empty when nothing is in focus."""
-        live = {k: v for k, v in self.focus_entities.items() if v}
-        if not live:
-            return ""
-        return "\n".join(f"- {k}: {v}" for k, v in live.items())
+        lines = []
+        for k, v in self.focus_entities.items():
+            if v:
+                lines.append(f"- {k}: {v}")
+        return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
 def get_state(thread_id: str) -> ThreadState:
     ensure_schema()
     with owner_engine().connect() as conn:
@@ -162,8 +146,8 @@ def append_turn(thread_id: str, user: str, assistant: str, route: str = "") -> N
         )
 
 
+# recent turns as [[user, assistant], ...], oldest first
 def get_history(thread_id: str, limit: int = MAX_HISTORY_TURNS) -> list[list[str]]:
-    """Recent turns as [[user, assistant], ...], oldest first."""
     ensure_schema()
     with owner_engine().connect() as conn:
         rows = conn.execute(
@@ -195,14 +179,8 @@ def clear_thread(thread_id: str) -> None:
                      {"t": thread_id})
 
 
-# ---------------------------------------------------------------------------
+# Merge this turn's mentioned entities into focus slots; unmentioned slots stay.
 def update_focus(current: dict[str, str], new_entities: dict[str, Any]) -> dict[str, str]:
-    """Merge freshly-detected entities into the focus slots.
-
-    Newly mentioned entities replace the slot; unmentioned slots persist, which
-    is what lets a follow-up like "and on Friday?" keep the doctor from the
-    previous turn.
-    """
     merged = dict(current)
     for slot in FOCUS_SLOTS:
         values = new_entities.get(slot)
@@ -211,9 +189,8 @@ def update_focus(current: dict[str, str], new_entities: dict[str, Any]) -> dict[
     return merged
 
 
-# ---------------------------------------------------------------------------
+# Save a cross-session preference; returns False if the key isn't allowlisted.
 def set_user_memory(user_id: str, key: str, value: str, thread_id: str = "") -> bool:
-    """Persist a cross-session preference. Returns False if the key is not allowed."""
     if key not in USER_MEMORY_ALLOWLIST:
         log.warning("memory.rejected_key", key=key,
                     reason="not on the non-sensitive allowlist")
@@ -232,7 +209,9 @@ def set_user_memory(user_id: str, key: str, value: str, thread_id: str = "") -> 
                        updated_at = now()
                 """
             ),
-            {"u": user_id, "k": key, "v": value[:500], "t": thread_id or None},
+            {"u": user_id, "k": key,
+             "v": value[: settings.memory_value_max_chars],
+             "t": thread_id or None},
         )
     return True
 

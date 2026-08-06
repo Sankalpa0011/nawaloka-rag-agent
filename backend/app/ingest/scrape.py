@@ -1,40 +1,7 @@
-"""Playwright-based scraper for www.nawaloka.com.
+"""Playwright scraper for www.nawaloka.com (a hydration-only React SPA).
 
-Why a headless browser and not requests+BeautifulSoup
------------------------------------------------------
-nawaloka.com is a client-side-rendered React application. A plain HTTP GET of
-any page returns the same ~900-byte shell::
-
-    <div id="root"></div>
-
-with all content produced by JavaScript after hydration. A requests-based
-scraper therefore yields an EMPTY corpus while appearing to succeed - the
-pipeline runs, chunks are produced from navigation boilerplate, and the vector
-store looks populated. Rendering the page in a real browser is the only
-reliable option here.
-
-Politeness
-----------
-robots.txt allows crawling and disallows only /node_modules/, /ajax/, /embed/,
-/cgi-bin/ and query-string URLs. We drive off the published sitemap, honour
-those disallows, cap concurrency at 3 and pause between requests.
-
-TLS note
---------
-www.nawaloka.com does not serve the intermediate certificate in its chain. Web
-browsers paper over this by fetching the missing certificate via the AIA
-extension, but Python's ``certifi`` bundle cannot, so httpx (and Playwright's
-own APIRequestContext, which uses Node's TLS stack) both fail with
-"unable to verify the first certificate". Chromium's network stack does the AIA
-fetch, so the sitemap is retrieved through a real browser page like every other
-request here. One TLS stack, no ``verify=False`` anywhere.
-
-Output
-------
-Raw rendered HTML is written to ``backend/data/raw/<slug>.html`` alongside a
-``manifest.json``. That cache is committed to the repository so the whole index
-can be rebuilt offline with ``python -m app.ingest.pipeline --from-cache`` -
-no network, no dependence on the live site still looking the same.
+Writes rendered HTML to backend/data/raw/<slug>.html plus a manifest.json,
+committed so the index can be rebuilt offline with `--from-cache`.
 """
 
 from __future__ import annotations
@@ -62,19 +29,7 @@ DISALLOWED_PREFIXES = ("/node_modules/", "/ajax/", "/embed/", "/cgi-bin/")
 
 ORIGIN = "https://www.nawaloka.com"
 
-# ---------------------------------------------------------------------------
-# Sitemap reconciliation
-#
-# The published sitemap is stale: three of its 30 URLs have no corresponding
-# route in the SPA's client-side router. Because the server returns index.html
-# for *any* path, those URLs answer HTTP 200 and render an empty page - there
-# is no status code, redirect or error to key off. They were caught only by the
-# rendered-text length guard below, which is precisely why that guard exists.
-#
-# The replacements were recovered from the route table in the application
-# bundle (static/js/main.*.js), which is also where the supplemental paths come
-# from: the router declares 63 routes, while the sitemap advertises 30.
-# ---------------------------------------------------------------------------
+# Sitemap reconciliation: swap known-stale URLs and add missing routes.
 STALE_SITEMAP_REPLACEMENTS: dict[str, tuple[str, ...]] = {
     "/healthchecks": ("/health-checkups",),
     "/elite-centre": ("/elite-corporate-centre", "/elite-vip-centre"),
@@ -97,9 +52,6 @@ SUPPLEMENTAL_PATHS: tuple[str, ...] = (
     "/quick-service-contacts",
 )
 
-# Transactional, authenticated and parameterised routes. These are application
-# UI rather than patient-facing information, so they are deliberately not part
-# of the knowledge base.
 EXCLUDED_PREFIXES: tuple[str, ...] = (
     "/elogin",
     "/payments",
@@ -115,12 +67,7 @@ EXCLUDED_PREFIXES: tuple[str, ...] = (
 
 
 def reconcile_urls(sitemap_urls: list[str]) -> tuple[list[str], dict[str, list[str]]]:
-    """Apply the stale-URL replacements and add the supplemental routes.
-
-    Returns ``(urls, changes)`` where *changes* records what was substituted or
-    added, so the manifest can explain why the crawled set differs from the
-    published sitemap.
-    """
+    """Apply stale-URL replacements and add supplemental routes; returns (urls, changes)."""
     changes: dict[str, list[str]] = {"replaced": [], "added": [], "excluded": []}
     out: list[str] = []
     seen: set[str] = set()
@@ -148,15 +95,11 @@ def reconcile_urls(sitemap_urls: list[str]) -> tuple[list[str], dict[str, list[s
 
     return out, changes
 
-# The SPA mounts everything under #root; waiting for it to have children is a
-# far better hydration signal than networkidle alone, which can fire while the
-# app is still an empty shell.
+# Waiting for #root to have children is a better hydration signal than networkidle alone.
 HYDRATION_SELECTOR = "#root > *"
 
-# Nav + footer are present on every page. If the rendered text is barely longer
-# than that, hydration produced no page-specific content and we must not treat
-# the result as a successful scrape.
-MIN_RENDERED_TEXT_CHARS = 400
+# Below this, hydration produced no page-specific content beyond nav/footer.
+MIN_RENDERED_TEXT_CHARS = settings.scrape_min_rendered_chars
 
 
 @dataclass
@@ -219,11 +162,7 @@ async def _sitemap_body(context, sitemap_url: str) -> str:
 async def fetch_sitemap_urls(
     sitemap_url: str | None = None, context=None
 ) -> list[str]:
-    """Read the published sitemap and return the crawlable URLs, in order.
-
-    ``context`` is an existing Playwright browser context. When omitted a
-    throwaway browser is launched, so the function is usable standalone.
-    """
+    """Read the published sitemap and return the crawlable URLs, in order."""
     sitemap_url = sitemap_url or settings.scrape_sitemap_url
 
     if context is not None:
@@ -267,9 +206,7 @@ async def _render_one(context, url: str, attempt: int) -> tuple[str, str, str]:
     """Render a single URL. Returns (html, visible_text, title)."""
     page = await context.new_page()
     try:
-        # Images/fonts/media are pure weight for a text corpus. Blocking them
-        # roughly halves render time and makes `networkidle` reachable on
-        # image-heavy hospital pages.
+        # Block images/fonts/media to speed up render and make networkidle reachable.
         await page.route(
             "**/*",
             lambda route: asyncio.ensure_future(
@@ -300,7 +237,12 @@ async def _render_one(context, url: str, attempt: int) -> tuple[str, str, str]:
         await page.close()
 
 
-async def scrape_url(context, url: str, out_dir: Path, max_attempts: int = 3) -> PageRecord:
+async def scrape_url(
+    context,
+    url: str,
+    out_dir: Path,
+    max_attempts: int = settings.scrape_max_attempts,
+) -> PageRecord:
     slug = slugify(url)
     rec = PageRecord(url=url, path=urlparse(url).path or "/", slug=slug, status="error")
 
@@ -315,7 +257,7 @@ async def scrape_url(context, url: str, out_dir: Path, max_attempts: int = 3) ->
             continue
 
         text_chars = len(text.strip())
-        if text_chars < MIN_RENDERED_TEXT_CHARS and attempt < max_attempts:
+        if text_chars < settings.scrape_min_rendered_chars and attempt < max_attempts:
             # Almost always a hydration race rather than a genuinely empty page.
             log.warning("scrape.too_short_retrying", url=url, attempt=attempt, chars=text_chars)
             await asyncio.sleep(2 * attempt)
@@ -325,7 +267,9 @@ async def scrape_url(context, url: str, out_dir: Path, max_attempts: int = 3) ->
         rec.title = title.strip()
         rec.fetched_at = datetime.now(timezone.utc).isoformat()
         rec.error = None
-        rec.status = "ok" if text_chars >= MIN_RENDERED_TEXT_CHARS else "empty"
+        rec.status = (
+            "ok" if text_chars >= settings.scrape_min_rendered_chars else "empty"
+        )
 
         if rec.status == "ok":
             out_path = out_dir / f"{slug}.html"
@@ -335,9 +279,7 @@ async def scrape_url(context, url: str, out_dir: Path, max_attempts: int = 3) ->
             rec.html_chars = len(html)
             log.info("scrape.ok", url=url, text_chars=text_chars, attempts=attempt)
         else:
-            # Never persist an empty render: the raw cache is committed to the
-            # repo and must not contain pages that would chunk into pure
-            # navigation boilerplate.
+            # Never persist an empty render into the committed raw cache.
             log.warning("scrape.empty", url=url, text_chars=text_chars, attempts=attempt)
         return rec
 
@@ -388,13 +330,17 @@ async def scrape_site(
     report.empty = sum(1 for r in results if r.status == "empty")
     report.failed = sum(1 for r in results if r.status == "error")
 
-    # Prune raw files left behind by an earlier crawl (a URL that has since
-    # been removed or renamed), so data/raw always mirrors the manifest.
-    keep = {f"{p.slug}.html" for p in report.pages if p.status == "ok"} | {"manifest.json"}
-    for stale in out_dir.glob("*.html"):
-        if stale.name not in keep:
-            stale.unlink()
-            log.info("scrape.pruned_stale_cache_file", file=stale.name)
+    # Prune stale cached files, but only if the crawl retrieved something -
+    # otherwise a total outage would look like "no pages" and wipe the cache.
+    if report.ok:
+        keep = {f"{p.slug}.html" for p in report.pages if p.status == "ok"} | {"manifest.json"}
+        for stale in out_dir.glob("*.html"):
+            if stale.name not in keep:
+                stale.unlink()
+                log.info("scrape.pruned_stale_cache_file", file=stale.name)
+    else:
+        log.warning("scrape.prune_skipped", reason="no page fetched successfully",
+                    cached_files=len(list(out_dir.glob("*.html"))))
 
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),

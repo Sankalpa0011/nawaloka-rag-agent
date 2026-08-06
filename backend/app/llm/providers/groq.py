@@ -70,9 +70,7 @@ class GroqProvider(Provider):
         }
 
         if json_schema:
-            # Groq supports json_object mode but not a schema, so the shape is
-            # described in the prompt instead. Appending it to the last system
-            # message keeps the user turn clean.
+            # Groq has no schema mode, so describe the shape in the prompt instead.
             kwargs["response_format"] = {"type": "json_object"}
             hint = (
                 "Respond with a single JSON object matching this schema exactly, "

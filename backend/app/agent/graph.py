@@ -3,19 +3,16 @@
     ingest -> guardrail -> route ->  SQL      -> sql_agent  ->\\
                     |                VECTOR   -> retrieve   -> synthesize -> finalize
                     |                HYBRID   -> both, concurrently ->/
-                    |
+                    |                              ^
+                    |            SQL found nothing |
+                    |                              |
                     +-[EMERGENCY|REFUSE]-> direct_answer -> finalize
                     +-[SMALLTALK|OUT_OF_SCOPE]-> direct_answer -> finalize
 
-Why LangGraph rather than an LLM tool-calling loop: "query routing accuracy" is
-a graded criterion, so the router has to be a standalone function that can be
-scored against a fixture set (see evals/score_routing.py). In a tool-calling
-loop, routing is an emergent property of the model's tool choice - impossible to
-measure, and impossible to fix without changing everything else.
-
-The HYBRID branch fans out to both sources concurrently. Because the two nodes
-write to different state keys (`sql_calls` vs `documents`), no locking or
-reducer conflict is possible.
+HYBRID fans out to sql_agent and retrieve concurrently; they write different
+state keys so there's no reducer conflict. A SQL turn that ends with no rows
+takes one pass through retrieve before synthesis (_wants_vector_fallback);
+this fires at most once per turn so it cannot become a cycle.
 """
 
 from __future__ import annotations
@@ -28,14 +25,14 @@ from app.agent import guardrail
 from app.agent.nodes.contextualize import contextualize_node
 from app.agent.nodes.faq import cache_write, faq_node
 from app.agent.nodes.retrieve import retrieve_node
-from app.agent.nodes.sql_agent import sql_agent_node
+from app.agent.nodes.sql_agent import sql_agent_node, sql_found_nothing
 from app.agent.nodes.synthesize import synthesize_node
 from app.agent.router import route_query
 from app.agent.signals import extract_signals
 from app.agent.state import AgentState, new_state, trace_event
 from app.config import settings
 from app.logging_conf import get_logger
-from app.memory import store
+from app.memory import decisions, store
 from app.memory.summarizer import should_summarise, summarise
 
 log = get_logger(__name__)
@@ -58,7 +55,6 @@ services we offer.
 Is there something about the hospital I can help you with?"""
 
 
-# ---------------------------------------------------------------------------
 async def ingest_node(state: AgentState) -> dict:
     return {
         "contextual_query": state.get("contextual_query") or state["user_query"],
@@ -68,16 +64,16 @@ async def ingest_node(state: AgentState) -> dict:
 
 async def guardrail_node(state: AgentState) -> dict:
     verdict = guardrail.check(state.get("contextual_query") or state["user_query"])
+    payload = verdict.to_dict()
+    # carry the response text through so direct_answer doesn't recheck the guardrail
+    payload["response"] = verdict.response
     out: dict = {
-        "guardrail": verdict.to_dict(),
+        "guardrail": payload,
         "disclaimer_required": verdict.disclaimer_required,
         "trace": [trace_event("guardrail", verdict=verdict.verdict,
                               reason=verdict.reason)],
     }
-    # An intercepted turn never reaches the classifier, so the route has to be
-    # set here. Without this `route` stays unset and direct_answer falls
-    # through to its final branch - which answered medical emergencies with the
-    # "I only handle hospital questions" message.
+    # route must be set here - an intercepted turn never reaches the classifier
     if verdict.short_circuits:
         out["route"] = verdict.verdict
     return out
@@ -104,14 +100,18 @@ async def route_node(state: AgentState) -> dict:
     }
 
 
+# greetings, refusals, emergencies - nothing to retrieve
 async def direct_answer_node(state: AgentState) -> dict:
-    """Answers that need no retrieval: greetings, refusals, emergencies."""
     route = state.get("route")
     guard = state.get("guardrail") or {}
 
     if route in ("EMERGENCY", "REFUSE"):
-        verdict = guardrail.check(state.get("contextual_query") or state["user_query"])
-        answer = verdict.response
+        answer = guard.get("response") or ""
+        if not answer:
+            # Only reachable if the route was set without check_safety running.
+            answer = guardrail.check(
+                state.get("contextual_query") or state["user_query"]
+            ).response
     elif route == "SMALLTALK":
         answer = SMALLTALK_REPLY
     else:
@@ -127,26 +127,78 @@ async def direct_answer_node(state: AgentState) -> dict:
 
 
 async def finalize_node(state: AgentState) -> dict:
-    # Cache writes happen here, after the answer has passed every check, so
-    # only fully validated responses are ever reused.
+    # cache only after the answer has passed every check
     cached = cache_write(state)
     memory_saved = await _persist_memory(state)
+    logged = _log_decision(state)
     return {
         "trace": [
             trace_event("finalize", route=state.get("route"), cached=cached,
-                        memory=memory_saved,
+                        memory=memory_saved, logged=logged,
                         citations=len(state.get("citations") or []))
         ]
     }
 
 
-async def _persist_memory(state: AgentState) -> bool:
-    """Record the turn and roll the focus slots forward.
+# Write the audit row for this turn. Done here rather than in route_node
+# because finalize is the only node every path passes through.
+def _log_decision(state: AgentState) -> bool:
+    if not settings.enable_decision_log:
+        return False
 
-    Memory failures never fail a turn - the answer has already been produced,
-    and losing a thread's continuity is a far smaller problem than losing the
-    reply.
-    """
+    route = state.get("route") or ""
+    if not route:
+        return False
+
+    decision = state.get("route_decision") or {}
+    raw_query = state.get("user_query", "")
+    contextual = state.get("contextual_query") or ""
+
+    if decision:
+        signals = decision.get("signals") or {}
+        llm_route = decision.get("llm_route", "")
+        confidence = decision.get("confidence")
+        rationale = decision.get("rationale", "")
+        overridden = bool(decision.get("overridden"))
+        latency_ms = decision.get("latency_ms")
+        if overridden and decision.get("override_reason"):
+            rationale = f"{rationale} [override: {decision['override_reason']}]"
+    elif route == "FAQ":
+        # a cache hit is a routing decision too - it decided not to route
+        cache = state.get("cache") or {}
+        signals = {"source": "faq", **cache}
+        llm_route = ""
+        confidence = cache.get("score")
+        rationale = f"{cache.get('tier', 'faq')} fast-path hit, no classification run"
+        overridden = False
+        latency_ms = cache.get("elapsed_ms")
+    else:
+        # guardrail interception: EMERGENCY and REFUSE never see a model at all
+        guard = state.get("guardrail") or {}
+        signals = {"source": "guardrail", **{k: v for k, v in guard.items()
+                                             if k != "response"}}
+        llm_route = ""
+        confidence = 1.0
+        rationale = f"guardrail: {guard.get('reason', 'short-circuited')}"
+        overridden = False
+        latency_ms = None
+
+    return decisions.log_decision(
+        thread_id=state.get("thread_id", "default"),
+        raw_query=raw_query,
+        contextual_query=contextual if contextual != raw_query else "",
+        final_route=route,
+        signals=signals,
+        llm_route=llm_route,
+        confidence=confidence,
+        rationale=rationale,
+        overridden=overridden,
+        latency_ms=latency_ms,
+    )
+
+
+# Persist the turn; failures here must never fail the turn itself.
+async def _persist_memory(state: AgentState) -> bool:
     if not settings.enable_memory:
         return False
 
@@ -167,7 +219,9 @@ async def _persist_memory(state: AgentState) -> bool:
         thread.focus_entities = store.update_focus(thread.focus_entities, signals.entities)
 
         if should_summarise(thread):
-            history = store.get_history(thread_id, limit=10)
+            history = store.get_history(
+                thread_id, limit=settings.memory_summary_history_turns
+            )
             summary = await summarise(history, thread.summary)
             if summary:
                 thread.summary = summary
@@ -179,30 +233,66 @@ async def _persist_memory(state: AgentState) -> bool:
         return False
 
 
+# emergencies and refusals are already decided, so skip the FAQ
 def _after_guardrail(state: AgentState) -> str:
-    """Emergencies and refusals skip the FAQ entirely - they are already decided."""
     verdict = (state.get("guardrail") or {}).get("verdict")
     if verdict in ("EMERGENCY", "REFUSE"):
         return "direct_answer"
     return "faq"
 
 
+# a cache hit is already an answer - no routing, retrieval or synthesis needed
 def _after_faq(state: AgentState) -> str:
-    """A cache hit is already an answer; skip routing, retrieval and synthesis."""
     return "finalize" if state.get("route") == "FAQ" else "classify"
 
 
-# ---------------------------------------------------------------------------
+#: Which node(s) each route fans out to; HYBRID runs both concurrently.
+_BRANCHES: dict[str, list[str] | str] = {
+    "EMERGENCY": "direct_answer",
+    "REFUSE": "direct_answer",
+    "SMALLTALK": "direct_answer",
+    "OUT_OF_SCOPE": "direct_answer",
+    "SQL": ["sql_agent"],
+    "VECTOR": ["retrieve"],
+    "HYBRID": ["sql_agent", "retrieve"],
+}
+
+
 def _branch(state: AgentState) -> list[str] | str:
-    route = state.get("route", "VECTOR")
-    if route in ("EMERGENCY", "REFUSE", "SMALLTALK", "OUT_OF_SCOPE"):
-        return "direct_answer"
-    if route == "SQL":
-        return ["sql_agent"]
-    if route == "VECTOR":
-        return ["retrieve"]
-    # HYBRID: both branches run concurrently and converge on synthesize.
-    return ["sql_agent", "retrieve"]
+    return _BRANCHES.get(state.get("route", "VECTOR"), ["retrieve"])
+
+
+def _sql_exhausted(state: AgentState) -> bool:
+    """Whether the SQL retry budget is used up. Attempt cap wins over last_error
+    so a call that fails the same way every time doesn't loop forever."""
+    if state.get("sql_attempts", 0) >= settings.sql_max_attempts:
+        return True
+    return not (state.get("last_error") or state.get("empty_with_filters"))
+
+
+def _wants_vector_fallback(state: AgentState) -> bool:
+    """A SQL turn that found zero rows gets one pass through the vector branch
+    instead of dead-ending, since the DB not having a record doesn't mean the
+    hospital doesn't offer it. Guarded to fire at most once per turn, and never
+    for HYBRID (which already scheduled retrieve at classify)."""
+    if not settings.enable_sql_vector_fallback:
+        return False
+    if state.get("route") != "SQL":
+        return False
+    if state.get("vector_fallback_used") or state.get("documents"):
+        return False
+    return sql_found_nothing(state)
+
+
+def _after_sql(state: AgentState) -> str:
+    """Retry sql_agent on error or an empty-with-filters result; once the retry
+    budget is spent, fall back to the vector branch if nothing was found at
+    all, otherwise go to synthesize."""
+    if not _sql_exhausted(state):
+        return "sql_agent"
+    if _wants_vector_fallback(state):
+        return "retrieve"
+    return "synthesize"
 
 
 def build_graph():
@@ -223,8 +313,8 @@ def build_graph():
     g.add_edge("ingest", "contextualize")
     g.add_edge("contextualize", "check_safety")
 
-    # The FAQ sits after the guardrail (so an emergency is never answered from
-    # a cache) and before routing (so a hit costs no LLM call at all).
+    # FAQ sits after the guardrail (never cache an emergency) and before
+    # routing (a hit costs no LLM call).
     g.add_conditional_edges(
         "check_safety",
         _after_guardrail,
@@ -241,7 +331,14 @@ def build_graph():
          "direct_answer": "direct_answer"},
     )
 
-    g.add_edge("sql_agent", "synthesize")
+    # sql_agent loops back on itself while a call keeps failing; once exhausted
+    # it falls through to retrieve (if nothing found) or straight to synthesize.
+    g.add_conditional_edges(
+        "sql_agent",
+        _after_sql,
+        {"sql_agent": "sql_agent", "retrieve": "retrieve",
+         "synthesize": "synthesize"},
+    )
     g.add_edge("retrieve", "synthesize")
     g.add_edge("synthesize", "finalize")
     g.add_edge("direct_answer", "finalize")
@@ -275,9 +372,8 @@ async def answer(
     return result
 
 
-# ---------------------------------------------------------------------------
 def main() -> int:
-    """Interactive CLI so the agent is demoable before the web UI exists."""
+    """Interactive CLI for testing the agent."""
     import argparse
     import asyncio
 

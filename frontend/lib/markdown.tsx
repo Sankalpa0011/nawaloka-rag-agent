@@ -1,10 +1,6 @@
-// Renders the small markdown subset the assistant actually produces:
-// bold, italic, inline code, bullet and numbered lists, headings, paragraphs.
-//
-// Hand-written rather than pulling in a markdown library for two reasons: the
-// answers use a narrow, predictable subset, and everything below builds React
-// elements rather than HTML strings - there is no dangerouslySetInnerHTML
-// anywhere, so model output can never inject markup.
+// Renders the small markdown subset the assistant produces (bold, italic,
+// inline code, lists, headings, paragraphs) as React elements - no
+// dangerouslySetInnerHTML, so model output can't inject markup.
 
 import React from "react";
 

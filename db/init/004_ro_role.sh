@@ -1,29 +1,4 @@
 #!/bin/bash
-# =============================================================================
-# 004_ro_role.sh - create the least-privilege role used by the SQL agent
-# =============================================================================
-# This is a .sh rather than a .sql because the password comes from the
-# environment, and files in /docker-entrypoint-initdb.d ending in .sql are fed
-# straight to psql with no variable expansion.
-#
-# Why this exists: the agent's SQL tool is the one component an attacker can
-# reach through prompt injection. Statement-level validation (sqlglot AST
-# checks in app/tools/sql_guard.py) is the first line of defence, but it is
-# defence in depth only if the database itself would refuse a write even when
-# the validator is bypassed. The application opens TWO connections:
-#
-#   DATABASE_URL     -> owner role, used for checkpoints / routing logs / memory
-#   DATABASE_RO_URL  -> chatbot_ro, used for EVERY agent-issued query
-#
-# chatbot_ro cannot write anything, cannot see conversation logs or user
-# memory, and is force-timed-out after 5 seconds.
-#
-# NOTE: the postgres entrypoint *sources* non-executable .sh files rather than
-# running them in a subshell, so this script deliberately does not `set -euo
-# pipefail` - that would leak shell options into the entrypoint and `set -u`
-# in particular breaks its own unset-variable handling. psql's ON_ERROR_STOP
-# plus the entrypoint's own `set -e` give us the failure behaviour we need.
-# =============================================================================
 
 psql -v ON_ERROR_STOP=1 \
      --username "$POSTGRES_USER" \

@@ -1,50 +1,37 @@
-"""Guarded Text-to-SQL fallback.
+"""Text-to-SQL fallback for the long tail sql_tools.py doesn't cover.
 
-The curated tools in ``sql_tools.py`` handle the common cases and are always
-preferred. This exists for the long tail - "which test has the longest
-turnaround under LKR 3000?", "how many doctors per department?" - where writing
-a tool for every shape of question is not realistic.
-
-Three things make a generated-SQL path acceptable here:
-
-1. **It is pointed at the same trap-proof views** as the curated tools, via the
-   schema card, so it inherits their correctness rather than re-learning the
-   data hazards from scratch.
-2. **Every statement passes the sqlglot AST guard** before execution, and runs
-   as a role that cannot write. Generation being wrong is a quality problem,
-   not a safety one.
-3. **Failures are repaired with the error in hand**, twice, and then given up
-   on honestly instead of being retried until something returns rows.
-
-On an empty result the query is *relaxed once* rather than retried - blind
-retry-on-empty is how agents end up inventing data that does not exist.
+Generated SQL is pointed at the same views (inherits the data-hazard fixes),
+runs through the sqlglot AST guard as a non-writing role, and gets one attempt
+per call - the retry loop lives in the graph (sql_agent). Empty results are
+relaxed once, never retried blindly.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 
-from app.config import PROMPTS_DIR
+from app.config import PROMPTS_DIR, settings
 from app.llm.base import Msg
 from app.llm.router import get_router
 from app.logging_conf import get_logger
+from app.prompts.schema import table_ddl
+from app.prompts.templates import TEXT2SQL, render
 from app.tools.db import fetch
 from app.tools.sql_guard import SqlGuardError, validate_sql
 from app.tools.sql_tools import SqlToolResult
 
 log = get_logger(__name__)
 
-MAX_REPAIRS = 2
 
-_SCHEMA_CARD: str | None = None
-
-
+# Two halves: the column list comes from the database, the hazard notes come
+# from the file. Neither can produce the other - introspection doesn't know that
+# an inner join drops two doctors, and a markdown file can't notice a rename.
+@lru_cache(maxsize=1)
 def schema_card() -> str:
-    global _SCHEMA_CARD
-    if _SCHEMA_CARD is None:
-        _SCHEMA_CARD = (PROMPTS_DIR / "schema_card.md").read_text(encoding="utf-8")
-    return _SCHEMA_CARD
+    notes = (PROMPTS_DIR / "schema_card.md").read_text(encoding="utf-8")
+    return f"{table_ddl()}\n\n{notes}"
 
 
 SQL_SCHEMA = {
@@ -55,19 +42,6 @@ SQL_SCHEMA = {
     },
     "required": ["sql"],
 }
-
-SYSTEM = """You write a single PostgreSQL SELECT for a hospital assistant.
-
-Return JSON: {"sql": "...", "explanation": "one sentence"}
-
-Absolute rules:
-- exactly ONE SELECT statement, no semicolon, no DDL, no writes
-- only the relations in the schema below
-- always include a LIMIT
-- match user text with ILIKE '%...%' or similarity(col, '...') > 0.3, never =
-- prefer the views; they resolve known data hazards the base tables do not
-
-""" + "{schema}"
 
 
 @dataclass
@@ -103,7 +77,7 @@ class Text2SqlResult:
             "sql": " ".join(self.sql.split()),
             "explanation": self.explanation,
             "row_count": self.row_count,
-            "rows": self.rows[:50],
+            "rows": self.rows[: settings.text2sql_max_rows_in_payload],
             "attempts": self.attempts,
             "repairs": self.repairs,
             "relaxed": self.relaxed,
@@ -114,42 +88,46 @@ class Text2SqlResult:
 
 
 def _messages(question: str, failures: list[tuple[str, str]]) -> list[Msg]:
-    msgs = [Msg("system", SYSTEM.replace("{schema}", schema_card()))]
+    msgs = render(TEXT2SQL, schema=schema_card(), input=f"Question: {question}")
 
     if failures:
-        # Accumulate every failed attempt so the model does not loop on the
-        # same mistake; showing only the latest error is not enough.
+        # Show every failed attempt so the model doesn't repeat the same mistake.
         lines = ["Previous attempts failed. Do not repeat these mistakes:"]
         for sql, err in failures:
             lines.append(f"\nSQL:\n{sql}\nError: {err}")
-        msgs.append(Msg("user", "\n".join(lines)))
+        msgs.insert(1, Msg("user", "\n".join(lines)))
 
-    msgs.append(Msg("user", f"Question: {question}"))
     return msgs
 
 
-async def generate_and_run(question: str, allow_relax: bool = True) -> Text2SqlResult:
+async def generate_and_run(
+    question: str,
+    allow_relax: bool = True,
+    feedback: list[str] | None = None,
+) -> Text2SqlResult:
+    """Generate one SQL statement, guard it, run it - a single attempt (retries
+    live in the graph). `feedback` is what the graph collected on earlier passes.
+    Relaxing an empty result stays here, since that's not error recovery.
+    """
     started = time.perf_counter()
     result = Text2SqlResult(question=question)
     failures: list[tuple[str, str]] = []
+    for prior in feedback or []:
+        failures.append(("<earlier attempt this turn>", prior))
 
-    for attempt in range(1, MAX_REPAIRS + 2):
+    for attempt in range(1, 2):
         result.attempts = attempt
         try:
             data, response = await get_router().complete_json(
                 _messages(question, failures),
                 SQL_SCHEMA,
                 tier="strong",
-                # A generous ceiling: a truncated response is unparseable JSON,
-                # and 600 tokens was measured to cut off mid-statement on
-                # multi-column SELECTs.
-                max_tokens=1200,
+                # Generous ceiling - a truncated response is unparseable JSON.
+                max_tokens=settings.text2sql_max_tokens,
             )
             result.provider = response.provider
         except Exception as exc:
-            # Generation failures (truncation, malformed JSON, a provider
-            # hiccup) are retryable like any other. Abandoning on the first one
-            # wasted the repair budget that exists precisely for this.
+            # Truncation, bad JSON, a provider hiccup: retryable like any other failure.
             message = f"{type(exc).__name__}: {exc}"
             result.error = f"generation failed: {message}"
             result.repairs.append(message)
@@ -159,9 +137,11 @@ async def generate_and_run(question: str, allow_relax: bool = True) -> Text2SqlR
             continue
 
         raw_sql = str(data.get("sql", "")).strip()
-        result.explanation = str(data.get("explanation", ""))[:300]
+        result.explanation = str(data.get("explanation", ""))[
+            : settings.text2sql_explanation_max_chars
+        ]
 
-        # --- validate -----------------------------------------------------
+        #  validate 
         try:
             guarded = validate_sql(raw_sql)
         except SqlGuardError as exc:
@@ -172,7 +152,7 @@ async def generate_and_run(question: str, allow_relax: bool = True) -> Text2SqlR
 
         result.sql = guarded.sql
 
-        # --- execute ------------------------------------------------------
+        # execute 
         try:
             rows, _ = fetch(guarded.sql)
         except Exception as exc:
@@ -191,7 +171,7 @@ async def generate_and_run(question: str, allow_relax: bool = True) -> Text2SqlR
             log.info("text2sql.ok", attempts=attempt, rows=len(rows))
             return result
 
-        # --- empty result: relax once, then stop --------------------------
+        # empty result: relax once, then stop 
         if allow_relax and not result.relaxed:
             result.relaxed = True
             relaxed = await _relax(question, guarded.sql)
@@ -225,37 +205,31 @@ async def generate_and_run(question: str, allow_relax: bool = True) -> Text2SqlR
         result.elapsed_ms = int((time.perf_counter() - started) * 1000)
         return result
 
-    # Exhausted repairs.
+    # Attempt failed. The graph decides whether that's worth another go.
     if not result.error:
-        result.error = f"could not produce valid SQL after {result.attempts} attempts"
-    result.notes.append(
-        "The database query could not be completed. Tell the user you were "
-        "unable to look this up rather than guessing an answer."
-    )
+        result.error = "could not produce valid SQL"
     result.elapsed_ms = int((time.perf_counter() - started) * 1000)
-    log.error("text2sql.gave_up", attempts=result.attempts, repairs=result.repairs)
+    log.warning("text2sql.attempt_failed", repairs=result.repairs)
     return result
 
 
+# ask for the same query again with its tightest filter dropped
 async def _relax(question: str, sql: str) -> str | None:
-    """Ask for the same query with its most restrictive filter dropped."""
     try:
         data, _ = await get_router().complete_json(
-            [
-                Msg("system", SYSTEM.replace("{schema}", schema_card())),
-                Msg(
-                    "user",
-                    "This query returned no rows:\n\n"
-                    f"{sql}\n\n"
-                    f"Original question: {question}\n\n"
-                    "Rewrite it with ONLY the single most restrictive filter removed, "
-                    "so it returns closely related rows. Keep every other condition. "
-                    "Do not invent tables or columns.",
-                ),
-            ],
+            render(
+                TEXT2SQL,
+                schema=schema_card(),
+                input="This query returned no rows:\n\n"
+                f"{sql}\n\n"
+                f"Original question: {question}\n\n"
+                "Rewrite it with ONLY the single most restrictive filter removed, "
+                "so it returns closely related rows. Keep every other condition. "
+                "Do not invent tables or columns.",
+            ),
             SQL_SCHEMA,
             tier="fast",
-            max_tokens=400,
+            max_tokens=settings.text2sql_relax_max_tokens,
         )
         return str(data.get("sql", "")).strip() or None
     except Exception as exc:

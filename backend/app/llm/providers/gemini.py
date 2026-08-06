@@ -63,13 +63,14 @@ def _json_schema_to_gemini(schema: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# turn an SDK exception into one of our error types
 def _raise_for(exc: Exception) -> None:
-    """Translate an SDK exception into our error taxonomy."""
     status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     message = str(exc)
 
     if status is None:
-        # google-genai raises ClientError/ServerError with the code in the text.
+        # google-genai buries the code in the message text; extract it.
+        # TODO: fragile, and this import belongs at the top of the file
         import re
 
         m = re.search(r"\b(4\d{2}|5\d{2})\b", message)
@@ -171,9 +172,7 @@ class GeminiProvider(Provider):
             cfg["system_instruction"] = system
 
         try:
-            # NOTE: generate_content_stream returns an async generator directly,
-            # it is not awaitable. Awaiting it raises
-            # "object async_generator can't be used in 'await' expression".
+            # generate_content_stream returns an async generator directly, not awaitable.
             stream = _client().aio.models.generate_content_stream(
                 model=model, contents=contents, config=gt.GenerateContentConfig(**cfg)
             )
@@ -184,21 +183,12 @@ class GeminiProvider(Provider):
             _raise_for(exc)
 
 
-#: Prefixes Google AI Studio has issued. ``AIza`` is the long-standing format;
-#: ``AQ.`` is the newer one now issued to fresh accounts. Both are valid, so
-#: this is only used to catch obviously-wrong credentials (OAuth tokens,
-#: service-account JSON), never to reject a key.
+#: Known AI Studio key prefixes, used only to flag an obvious paste error.
 KNOWN_KEY_PREFIXES = ("AIza", "AQ.")
 
 
 def check_key_format(key: str) -> str | None:
-    """Warn only when a value is clearly not an AI Studio key at all.
-
-    Note: do NOT treat an unfamiliar prefix as fatal. Google has changed the
-    key format at least once (``AIza…`` -> ``AQ.…``), and a hard format check
-    would reject perfectly valid new keys. Authentication is decided by the
-    API, not by us; this exists purely to make a common paste-error obvious.
-    """
+    """Warn only when a value is clearly not an AI Studio key at all."""
     if not key:
         return None
     if key.startswith(KNOWN_KEY_PREFIXES):

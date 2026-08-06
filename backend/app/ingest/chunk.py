@@ -1,28 +1,6 @@
-"""Structure-aware chunking of the extracted markdown.
+"""Structure-aware chunking of extracted markdown into retrieval chunks.
 
-Three decisions worth calling out:
-
-**Breadcrumbs are embedded, not just stored.** Every chunk's text begins with
-its heading path, e.g. ``# Nawaloka Hospitals > Heart Centre > Cardiac
-Services``. It costs nothing (no extra LLM call) and fixes the classic RAG
-failure where a chunk reading "our consultants are available 24/7" is retrieved
-with no indication of *which* centre it belongs to. It also gives the sparse
-BM25 index the page name on every chunk.
-
-**The lab catalogue is batched, not chunked normally.** ``/lab-tests-online``
-carries 1,260 test names and is a quarter of the whole corpus. Chunked like
-prose it would produce hundreds of near-identical fragments that match almost
-any medical query on both dense and sparse vectors, swamping genuinely relevant
-pages. Instead it is grouped into alphabetical batches, each headed with its
-letter range, and tagged ``content_type="lab_catalogue"`` so retrieval and the
-answer layer can treat it as a availability list rather than prose.
-
-**Pricing provenance is recorded.** The website advertises health packages that
-do not exist in the relational database (e.g. "Premier Under 40 Men",
-LKR 45,000), while the packages present in both agree on price. The database is
-the system of record for anything transactional, so chunks containing prices
-are flagged ``has_pricing`` with ``pricing_authority="sql"``, and the synthesis
-prompt is instructed to defer to SQL on any conflict.
+Breadcrumbs are embedded into chunk text; priced chunks are tagged pricing_authority="sql".
 """
 
 from __future__ import annotations
@@ -33,7 +11,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from app.config import DATA_DIR, EXTRACTED_DIR, RAW_HTML_DIR
+from app.config import DATA_DIR, EXTRACTED_DIR, RAW_HTML_DIR, settings
 from app.logging_conf import get_logger
 
 log = get_logger(__name__)
@@ -41,34 +19,22 @@ log = get_logger(__name__)
 SITE_NAME = "Nawaloka Hospitals"
 CATALOGUE_MARKER = "<!-- catalogue -->"
 
-# Chunk sizing, in approximate tokens (see _tokens()).
-#
-# These pages are built from many short Chakra cards, so splitting purely on
-# headings yields lots of 20-150 token fragments - too little context for the
-# reranker to judge and too little for the answer model to quote. Sections are
-# therefore *packed* greedily up to TARGET_TOKENS rather than merged only when
-# below a floor. 450 is the sweet spot for a cross-encoder reranker: large
-# enough to carry a complete idea, small enough that a hit is precise.
-TARGET_TOKENS = 450
-MAX_TOKENS = 700
-MIN_TOKENS = 60          # below this a chunk is a stray label, never emitted alone
-OVERLAP_TOKENS = 80
+# Chunk sizes, in rough tokens (see _tokens()). Sections are packed greedily
+# up to TARGET_TOKENS rather than merged only when under a floor.
+TARGET_TOKENS = settings.chunk_target_tokens
+MAX_TOKENS = settings.chunk_max_tokens
+MIN_TOKENS = settings.chunk_min_tokens   # a stray label, never emit it alone
+OVERLAP_TOKENS = settings.chunk_overlap_tokens
 
-# Lab catalogue batching.
-CATALOGUE_BATCH = 40
+# how many catalogue entries per batch
+CATALOGUE_BATCH = settings.chunk_catalogue_batch
 
-# Only these pages have a <select> that is a genuine data catalogue. The
-# extractor flags any large <select> as a catalogue, which is the right call at
-# that layer, but other pages use big dropdowns as form furniture - /international
-# has a country picker whose options ("United States Minor Outlying Islands")
-# would otherwise be indexed as if they were laboratory tests. Dropdowns on any
-# other page are discarded here.
+# Pages with a <select> that is a genuine data catalogue, not form furniture
 LAB_CATALOGUE_SLUGS = {"lab-tests-online"}
 
 PRICE_RE = re.compile(r"(?:LKR|Rs\.?)\s*[\d,]+(?:\.\d{2})?", re.I)
 
-# Content taxonomy. Drives retrieval filters, cache eligibility (news and
-# promotions are time-sensitive and must never be cached) and answer framing.
+# Content taxonomy. Drives retrieval filters, cache eligibility and answer framing.
 CONTENT_TYPE_BY_SLUG: dict[str, str] = {
     # Clinical centres of excellence
     "heart-centre": "centre",
@@ -158,15 +124,10 @@ class Chunk:
     extra: dict = field(default_factory=dict)
 
 
+# Rough token count (~4 chars/token), avoids pulling in a real tokenizer.
+# TODO: revisit if we ever chunk non-English pages, the ratio won't hold
 def _tokens(text: str) -> int:
-    """Approximate token count.
-
-    A real tokenizer would be exact, but adding tiktoken (or loading the
-    embedding model's tokenizer at chunk time) buys precision we do not need -
-    chunk boundaries are heuristic anyway. ~4 chars/token is a good English
-    approximation and keeps ingestion dependency-light.
-    """
-    return max(1, len(text) // 4)
+    return max(1, len(text) // settings.approx_chars_per_token)
 
 
 def _page_label(slug: str) -> str:
@@ -233,13 +194,9 @@ def split_sections(markdown: str) -> list[_Section]:
 
 
 def _pack_sections(sections: list[_Section]) -> list[_Section]:
-    """Greedily pack consecutive sections up to TARGET_TOKENS.
+    """Greedily pack consecutive sections up to settings.chunk_target_tokens.
 
-    Heading-only splitting fragments these pages badly (many sections are a
-    single card of 20-40 tokens). Packing keeps related cards together while
-    preserving their sub-headings inline, so the chunk still reads as
-    structured markdown. Catalogue sections are passed through untouched -
-    they are batched separately.
+    Catalogue sections pass through untouched; they are batched separately.
     """
     out: list[_Section] = []
     buf: _Section | None = None
@@ -263,29 +220,26 @@ def _pack_sections(sections: list[_Section]) -> list[_Section]:
             continue
 
         combined = _tokens(buf.body) + _tokens(sec.body)
-        if combined > TARGET_TOKENS:
+        if combined > settings.chunk_target_tokens:
             flush()
             buf = _Section(
                 heading=sec.heading, level=sec.level, trail=sec.trail, lines=list(sec.lines)
             )
             continue
 
-        # Keep the absorbed section's heading visible inside the chunk body so
-        # the structure survives packing.
+        # Keep the absorbed section's heading visible inside the chunk body.
         if sec.heading:
             buf.lines.extend(["", f"{'#' * min(max(sec.level, 2), 6)} {sec.heading}"])
         buf.lines.extend(["", *sec.lines])
 
     flush()
 
-    # Greedy packing can still leave a runt: a short section immediately
-    # followed by one that would blow the budget gets flushed on its own.
-    # Fold any such fragment into an adjacent prose section on the same page.
+    # Fold any undersized runt section into an adjacent prose section.
     merged: list[_Section] = []
     for sec in out:
         if (
             not sec.is_catalogue
-            and _tokens(sec.body) < MIN_TOKENS
+            and _tokens(sec.body) < settings.chunk_min_tokens
             and merged
             and not merged[-1].is_catalogue
         ):
@@ -293,12 +247,12 @@ def _pack_sections(sections: list[_Section]) -> list[_Section]:
             continue
         merged.append(sec)
 
-    # ...and if the runt was the very first section, push it into the next one.
+    # If the runt was the very first section, push it into the next one.
     if (
         len(merged) > 1
         and not merged[0].is_catalogue
         and not merged[1].is_catalogue
-        and _tokens(merged[0].body) < MIN_TOKENS
+        and _tokens(merged[0].body) < settings.chunk_min_tokens
     ):
         head = merged.pop(0)
         merged[0].lines = [*head.lines, "", *merged[0].lines]
@@ -310,7 +264,7 @@ def _pack_sections(sections: list[_Section]) -> list[_Section]:
 
 def _split_long(body: str) -> list[str]:
     """Recursively split an oversized section on paragraph boundaries."""
-    if _tokens(body) <= MAX_TOKENS:
+    if _tokens(body) <= settings.chunk_max_tokens:
         return [body]
 
     paras = [p for p in re.split(r"\n\s*\n", body) if p.strip()]
@@ -319,11 +273,13 @@ def _split_long(body: str) -> list[str]:
 
     for para in paras:
         candidate = "\n\n".join([*buf, para])
-        if buf and _tokens(candidate) > TARGET_TOKENS:
+        if buf and _tokens(candidate) > settings.chunk_target_tokens:
             parts.append("\n\n".join(buf))
-            # Carry the tail of the previous part forward as overlap so a fact
-            # split across the boundary is still retrievable from both sides.
-            tail = "\n\n".join(buf)[-OVERLAP_TOKENS * 4:]
+            # Carry the tail forward as overlap across the split boundary.
+            overlap_chars = (
+                settings.chunk_overlap_tokens * settings.approx_chars_per_token
+            )
+            tail = "\n\n".join(buf)[-overlap_chars:]
             buf = [tail, para] if tail else [para]
         else:
             buf.append(para)
@@ -333,10 +289,7 @@ def _split_long(body: str) -> list[str]:
     return parts or [body]
 
 
-# Catalogue entries are "<code> - <test name>". Two code families appear in the
-# source: "T000842" for individual tests and "?P000023" for profiles/panels -
-# the leading '?' is a literal question mark in the hospital's own data, not a
-# decoding artifact. Both are stripped so batches sort by test name.
+# Strips the "<code> - " prefix from catalogue entries so batches sort by test name.
 CATALOGUE_CODE_RE = re.compile(r"^[^\w\s]?[A-Za-z]{0,4}\d{4,}\s*-\s*")
 
 
@@ -345,10 +298,7 @@ def _catalogue_sort_key(item: str) -> str:
 
 
 def _batch_catalogue(section: _Section) -> list[tuple[str, str]]:
-    """Group catalogue items into alphabetical batches.
-
-    Returns (label, text) pairs where *label* names the range, e.g. "A - AL".
-    """
+    """Group catalogue items into alphabetical batches: (label, text) pairs."""
     items = [ln.lstrip("- ").strip() for ln in section.lines if ln.strip().startswith("-")]
     items = [i for i in items if i]
     if not items:
@@ -357,8 +307,8 @@ def _batch_catalogue(section: _Section) -> list[tuple[str, str]]:
     items.sort(key=_catalogue_sort_key)
 
     out: list[tuple[str, str]] = []
-    for i in range(0, len(items), CATALOGUE_BATCH):
-        batch = items[i : i + CATALOGUE_BATCH]
+    for i in range(0, len(items), settings.chunk_catalogue_batch):
+        batch = items[i : i + settings.chunk_catalogue_batch]
         first = _catalogue_sort_key(batch[0])[:14].strip().title()
         last = _catalogue_sort_key(batch[-1])[:14].strip().title()
         label = f"{first} to {last}"
@@ -537,9 +487,9 @@ def main() -> int:
     print(f"chunks with pricing (SQL authoritative): "
           f"{sum(1 for c in chunks if c.has_pricing)}")
 
-    oversized = [c for c in chunks if c.token_count > MAX_TOKENS]
+    oversized = [c for c in chunks if c.token_count > settings.chunk_max_tokens]
     if oversized:
-        print(f"\n{len(oversized)} chunk(s) exceed MAX_TOKENS={MAX_TOKENS}:")
+        print(f"\n{len(oversized)} chunk(s) exceed MAX_TOKENS={settings.chunk_max_tokens}:")
         for c in oversized[:5]:
             print(f"  ! {c.chunk_id} ({c.token_count})")
 

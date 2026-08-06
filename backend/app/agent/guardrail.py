@@ -1,22 +1,9 @@
-"""Pre-routing safety checks for a healthcare assistant.
+"""Safety checks that run before routing.
 
-Deliberately **deterministic**. Two reasons:
-
-1. Latency and reliability. Someone typing "my father collapsed" must not wait
-   on a rate-limited model, and must not depend on that model choosing to be
-   careful rather than helpful.
-2. Testability. A regex phrase list can be asserted against in CI; a prompt
-   instruction cannot.
-
-Two categories are intercepted before routing:
-
-**EMERGENCY** - short-circuits the entire graph to a fixed response carrying the
-Sri Lankan emergency ambulance number (1990 Suwa Seriya).
-
-**REFUSE** - requests for diagnosis, prescriptions or interpretation of the
-user's own results. These are declined and redirected to a consultation. Note
-what is *not* refused: naming the specialty that normally treats a complaint is
-navigation, and is the single most useful thing this assistant can do.
+Deterministic (regex-based) rather than model-based, so it's fast and
+testable. EMERGENCY short-circuits the graph to a fixed response with the
+ambulance number. REFUSE covers diagnosis, prescriptions and result
+interpretation, and points the user at a consultation instead.
 """
 
 from __future__ import annotations
@@ -27,25 +14,19 @@ from typing import Literal
 
 GuardrailVerdict = Literal["EMERGENCY", "REFUSE", "SYMPTOM", "CLEAR"]
 
-AMBULANCE = "1990 Suwa Seriya"
-HOSPITAL_EMERGENCY = "0115 777 777"
-#: Nawaloka's own emergency ambulance, taken from the scraped
-#: /quick-service-contacts page rather than assumed.
-ETU_AMBULANCE = "077 951 1929"
+from app.contact import ETU_AMBULANCE, HOTLINE, NATIONAL_AMBULANCE
 
-# --------------------------------------------------------------------------
-# Emergency. Patterns are intentionally specific: "chest pain" alone is a
-# routine navigational query ("who treats chest pain?"), but chest pain with
-# breathing difficulty is not.
-# --------------------------------------------------------------------------
+# local aliases for the emergency text below
+AMBULANCE = NATIONAL_AMBULANCE
+HOSPITAL_EMERGENCY = HOTLINE
+
+# Emergency patterns - deliberately specific so navigational questions
 EMERGENCY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bcan'?t\s+breathe|\bnot\s+breathing|\bstopped\s+breathing", "breathing difficulty"),
     (r"\bchest\s+pain\b.{0,40}\b(breath|breathe|sweat|arm|jaw|crush)", "cardiac symptoms"),
     (r"\bcrushing\s+chest\b|\bheart\s+attack\b", "suspected heart attack"),
     (r"\bunconscious\b|\bcollapsed\b|\bpassed\s+out\b|\bnot\s+responding\b", "unresponsive patient"),
-    # "stroke" alone is not enough - "do you have a stroke rehabilitation
-    # programme" is a service question, not an emergency. Require an acute
-    # framing or a hallmark symptom.
+    # "stroke" alone isn't enough - require an acute framing or a hallmark symptom
     (r"\b(having|had|suffered|suffering)\s+(a\s+)?stroke\b"
      r"|\bstroke\s+(right\s+)?now\b|\bface\s+is\s+drooping\b|\bslurred\s+speech\b",
      "suspected stroke"),
@@ -58,19 +39,14 @@ EMERGENCY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bsevere\s+burn|\bmajor\s+accident\b|\bhit\s+by\s+a\s+(car|bus|vehicle)", "major trauma"),
 )
 
-# --------------------------------------------------------------------------
 # Clinical advice we must not give.
-# --------------------------------------------------------------------------
 REFUSE_PATTERNS: tuple[tuple[str, str, str], ...] = (
     (
         r"\bwhat\s+(disease|illness|condition)\s+do\s+i\s+have\b"
         r"|\bwhat'?s\s+wrong\s+with\s+me\b"
         r"|\bdo\s+i\s+have\s+(cancer|diabetes|covid|a\s+tumou?r)\b"
         r"|\bdiagnos(e|is)\s+me\b"
-        # Third-person and hypothetical phrasings ask for the same thing.
-        # Caught after a rewrite turned "if someone had my symptoms, what
-        # would they have?" into "what are the possible diagnoses for chest
-        # pain" - which the first-person patterns above do not match.
+        # also catch third-person/hypothetical phrasings of the same request
         r"|\b(possible|likely|differential)\s+diagnos(is|es)\b"
         r"|\bwhat\s+(disease|illness|condition)s?\s+(would|could|might|does)\b"
         r"|\bwhat\s+causes?\s+(my|these|those)\s+\w+",
@@ -96,18 +72,15 @@ REFUSE_PATTERNS: tuple[tuple[str, str, str], ...] = (
         "medication change",
         "I can't advise on changing medication.",
     ),
+    (
+        r"\b(book|cancel|reschedule|make)\s+(an\s+)?(appointment|channeling|booking)\b"
+        r"|\bbook\s+(a\s+)?(doctor|session)\b",
+        "appointment action",
+        "I can only provide information about channeling schedules and fees. I cannot make, cancel, or reschedule bookings for you.",
+    ),
 )
 
-# --------------------------------------------------------------------------
-# Over-triggering guard.
-#
-# Emergency patterns necessarily contain alarming words, and a hospital site is
-# full of pages about exactly those words. "Do you have a stroke rehabilitation
-# programme" is a service question; answering it with an ambulance number makes
-# the assistant useless for its actual job. A match is therefore suppressed
-# when the query reads as a question *about hospital services* and contains no
-# sign that something is happening to someone right now.
-# --------------------------------------------------------------------------
+# Over-triggering guard: suppress an emergency match when the query reads as
 SERVICE_QUERY = re.compile(
     r"\b(do you (have|offer|provide|treat|do)|is there (a|an)|what (is|are|does)"
     r"|tell me about|which (doctor|specialist|clinic|centre|center)|who treats"
@@ -117,8 +90,7 @@ SERVICE_QUERY = re.compile(
     re.I,
 )
 
-# Someone describing a live situation: first/third-person plus a present-tense
-# or recent-past verb.
+# someone describing something happening now - a person plus a present or
 ACUTE_FRAMING = re.compile(
     r"\b(i|my|he|she|we|they|someone|somebody)\b[^.?!]{0,40}"
     r"\b(am|is|are|'m|'s|was|were|has|have|had|having|feel|feeling|think|"
@@ -132,18 +104,12 @@ def _is_service_question(text: str) -> bool:
     return bool(SERVICE_QUERY.search(text)) and not ACUTE_FRAMING.search(text)
 
 
-# Mentions a symptom without being an emergency - allowed, but the answer gets
-# a "this is not a diagnosis" framing.
+# symptom mentioned but not an emergency - reply gets a "not a diagnosis" note
 SYMPTOM_HINT = re.compile(
     r"\b(pain|ache|aching|fever|cough|rash|swelling|dizzy|dizziness|nausea|"
     r"vomit|bleeding|lump|tired|fatigue|breathless|sore|infection|injur|"
-    # Everyday illnesses were missing entirely, and their absence was not
-    # cosmetic: "my brother got cold who needs to contact?" was not flagged, so
-    # it reached the FAQ fast path and came back with the ambulance number.
     r"cold|flu\b|influenza|headache|migraine|allerg|itch|burn|sprain|fracture|"
-    # "numbness", not "numb": the pattern is prefix-matched, so bare "numb"
-    # also claims "number" and put a medical disclaimer on every request for a
-    # phone number.
+    # "numbness" not "numb" - bare "numb" would also match "number"
     r"diarrh|constipat|heartburn|wheez|numbness|weakness|blurred|stomach)",
     re.I,
 )
@@ -158,9 +124,9 @@ class GuardrailResult:
     response: str = ""
     flags: list[str] = field(default_factory=list)
 
+    # graph has to answer straight away, no retrieval or SQL
     @property
     def short_circuits(self) -> bool:
-        """True when the graph must answer immediately without retrieval or SQL."""
         return self.verdict in ("EMERGENCY", "REFUSE")
 
     def to_dict(self) -> dict:
@@ -174,7 +140,7 @@ class GuardrailResult:
 
 EMERGENCY_RESPONSE = f"""**This may be a medical emergency. Please get help now.**
 
-- **Ambulance: {AMBULANCE}** — free nationwide emergency ambulance service
+- **Ambulance: {AMBULANCE}** - free nationwide emergency ambulance service
 - **Nawaloka ETU ambulance: {ETU_AMBULANCE}**
 - **Nawaloka Hospital: {HOSPITAL_EMERGENCY}**
 - Or go to your nearest emergency department immediately
@@ -197,8 +163,8 @@ What I can do is help you reach one:
 If this is urgent, call **{AMBULANCE}** or go to the nearest emergency department."""
 
 
+# classify a query before it gets anywhere near the router
 def check(query: str) -> GuardrailResult:
-    """Classify a query before it reaches routing."""
     text = (query or "").lower().strip()
     if not text:
         return GuardrailResult()

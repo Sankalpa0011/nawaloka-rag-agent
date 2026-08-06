@@ -1,5 +1,3 @@
-"""Vector branch: hybrid retrieval over the scraped site content."""
-
 from __future__ import annotations
 
 import asyncio
@@ -12,19 +10,19 @@ log = get_logger(__name__)
 
 
 async def retrieve_node(state: AgentState) -> dict:
+
+    fallback = state.get("route") == "SQL"
     query = (
         state.get("vector_intent")
         or state.get("contextual_query")
         or state["user_query"]
     )
 
-    # hybrid_search is CPU-bound (ONNX embedding + cross-encoder rerank);
-    # running it in a thread keeps the event loop free so the SQL branch can
-    # make progress concurrently during a HYBRID turn.
     result = await asyncio.to_thread(hybrid_search, query)
 
-    documents = [
-        {
+    documents = []
+    for c in result.chunks:
+        documents.append({
             "chunk_id": c.chunk_id,
             "citation": c.citation,
             "url": c.url,
@@ -35,15 +33,15 @@ async def retrieve_node(state: AgentState) -> dict:
             "has_pricing": c.has_pricing,
             "rerank_score": c.rerank_score,
             "rank": c.rank,
-        }
-        for c in result.chunks
-    ]
+        })
 
     log.info("retrieve.done", query=query[:80], returned=len(documents),
-             dropped=result.dropped_below_floor, ms=result.elapsed_ms)
+             dropped=result.dropped_below_floor, ms=result.elapsed_ms,
+             fallback=fallback)
 
     return {
         "documents": documents,
+        "vector_fallback_used": fallback,
         "retrieval": {
             "query": query,
             "candidates": result.candidates_considered,
@@ -52,6 +50,7 @@ async def retrieve_node(state: AgentState) -> dict:
             "reranked": result.reranked,
             "abstained": result.abstained,
             "elapsed_ms": result.elapsed_ms,
+            "fallback": fallback,
         },
         "trace": [
             trace_event(
@@ -60,6 +59,7 @@ async def retrieve_node(state: AgentState) -> dict:
                 dropped=result.dropped_below_floor,
                 abstained=result.abstained,
                 ms=result.elapsed_ms,
+                fallback=fallback,
             )
         ],
     }

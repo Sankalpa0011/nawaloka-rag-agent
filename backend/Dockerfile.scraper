@@ -1,0 +1,41 @@
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpq5 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && playwright install --with-deps chromium
+
+COPY app ./app
+
+ENTRYPOINT ["sh", "-c", "\
+    if [ -f data/raw/manifest.json ]; then \
+        echo 'scraper: data/raw/manifest.json already present, skipping live crawl'; \
+        exit 0; \
+    fi; \
+    echo 'scraper: no cached corpus found, crawling nawaloka.com...'; \
+    if python -m app.ingest.scrape; then \
+        echo 'scraper: crawl complete, corpus written to data/raw'; \
+        exit 0; \
+    fi; \
+    echo '=================================================================='; \
+    echo 'scraper: CRAWL FAILED - see the traceback above.'; \
+    echo 'scraper: data/raw is empty, so the vector store cannot be built.'; \
+    echo 'scraper: Starting the API anyway, DEGRADED - it will answer'; \
+    echo 'scraper: database questions and report the vector store missing'; \
+    echo 'scraper: on /health, but cannot answer website questions.'; \
+    echo 'scraper: To fix, restore the committed cache:'; \
+    echo 'scraper:     git checkout -- backend/data/raw'; \
+    echo 'scraper: then rebuild the index:'; \
+    echo 'scraper:     docker compose exec backend python -m app.ingest.pipeline'; \
+    echo '=================================================================='; \
+    exit 0 \
+"]

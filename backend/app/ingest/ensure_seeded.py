@@ -1,26 +1,13 @@
-"""Make the service self-seeding.
+"""Seeds Qdrant collections on API startup if they're empty; idempotent.
 
-Postgres initialises itself from db/init on first start, but Qdrant does not -
-it comes up empty. Without this, `docker compose up` produces a system that
-answers database questions correctly and silently abstains on every question
-that needs the website knowledge base, which is a confusing way to fail.
-
-`ensure_seeded()` is called from the API's startup lifespan: it waits for both
-stores, checks whether the vector collections already hold data, and builds them
-from the committed HTML cache if not. It is idempotent, so a restart costs one
-cheap count query.
-
-Seeding never blocks startup. If it fails, the API still comes up and answers
-what it can from Postgres, and /health reports the vector store as missing -
-which is far more debuggable than an API that refuses to start.
-
-It also runs standalone (`python -m app.ingest.ensure_seeded`) for seeding
-against an API that is already up, or when SEED_ON_STARTUP is turned off.
+Never blocks startup - seeding failures are logged and surfaced via /health.
+Also runnable standalone: `python -m app.ingest.ensure_seeded`.
 """
+# TODO: this seeds three collections now (web corpus, FAQ, symptom ontology) -
+# the naming still reads like there's only one.
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 
@@ -29,8 +16,9 @@ from app.logging_conf import get_logger
 
 log = get_logger(__name__)
 
-WAIT_TIMEOUT = float(os.getenv("SEED_WAIT_TIMEOUT", "120"))
-POLL_SECONDS = 2.0
+# Re-exported from app/config.py for backward-compat imports.
+WAIT_TIMEOUT = settings.seed_wait_timeout
+POLL_SECONDS = settings.seed_poll_seconds
 
 
 def _wait_for_postgres(deadline: float) -> bool:
@@ -43,7 +31,7 @@ def _wait_for_postgres(deadline: float) -> bool:
             return True
         except Exception as exc:
             log.info("seed.waiting_for_postgres", error=str(exc)[:80])
-            time.sleep(POLL_SECONDS)
+            time.sleep(settings.seed_poll_seconds)
     return False
 
 
@@ -57,7 +45,7 @@ def _wait_for_qdrant(deadline: float) -> bool:
             return True
         except Exception as exc:
             log.info("seed.waiting_for_qdrant", error=str(exc)[:80])
-            time.sleep(POLL_SECONDS)
+            time.sleep(settings.seed_poll_seconds)
     return False
 
 
@@ -71,22 +59,25 @@ def _points(collection: str) -> int:
 
 
 def ensure_seeded() -> None:
-    if os.getenv("SEED_ON_STARTUP", "true").lower() in ("0", "false", "no"):
+    if not settings.seed_on_startup:
         log.info("seed.disabled")
         return
 
-    deadline = time.time() + WAIT_TIMEOUT
+    timeout = settings.seed_wait_timeout
+    deadline = time.time() + timeout
 
     if not _wait_for_postgres(deadline):
-        log.error("seed.postgres_unavailable", waited=WAIT_TIMEOUT)
-        return  # start anyway; /health will show it
+        log.error("seed.postgres_unavailable", waited=timeout)
+        return
     if not _wait_for_qdrant(deadline):
-        log.error("seed.qdrant_unavailable", waited=WAIT_TIMEOUT)
+        log.error("seed.qdrant_unavailable", waited=timeout)
         return
 
     web = _points(settings.qdrant_collection)
     faq = _points(settings.qdrant_faq_collection)
-    log.info("seed.current_state", web_points=web, faq_points=faq)
+    ontology = _points(settings.qdrant_ontology_collection)
+    log.info("seed.current_state", web_points=web, faq_points=faq,
+             ontology_points=ontology)
 
     if web == 0:
         log.info("seed.building_index", note="from committed HTML cache, no network")
@@ -95,20 +86,37 @@ def ensure_seeded() -> None:
 
             stats = run(scrape=False)
             log.info("seed.index_built", **{k: v for k, v in stats.items() if k == "index"})
-        except Exception as exc:
+        # Catch SystemExit too: pipeline.run() raises it on a refusal, and
+        # letting it through would take the API down on startup.
+        except (Exception, SystemExit) as exc:
             log.error("seed.index_failed", error=str(exc)[:300])
     else:
         log.info("seed.index_present", points=web)
 
-    if faq == 0:
-        try:
-            from app.ingest.faq_seed import build
+    # Point count alone can't detect deletions, so compare against FAQ_REVISION
+    # instead; bumping it triggers a rebuild via build(recreate=True).
+    try:
+        from app.ingest.faq_seed import FAQ_REVISION, build, seeded_revision
 
-            log.info("seed.faq_built", entries=build())
+        seeded = seeded_revision() if faq else None
+        if seeded == FAQ_REVISION:
+            log.info("seed.faq_present", points=faq, revision=seeded)
+        else:
+            log.info("seed.faq_rebuilding", points=faq, seeded=seeded,
+                     wanted=FAQ_REVISION)
+            log.info("seed.faq_built", entries=build(), revision=FAQ_REVISION)
+    except Exception as exc:
+        log.error("seed.faq_failed", error=str(exc)[:300])
+
+    if ontology == 0:
+        try:
+            from app.retrieval.ontology import seed
+
+            log.info("seed.ontology_built", points=seed())
         except Exception as exc:
-            log.error("seed.faq_failed", error=str(exc)[:300])
+            log.error("seed.ontology_failed", error=str(exc)[:300])
     else:
-        log.info("seed.faq_present", points=faq)
+        log.info("seed.ontology_present", points=ontology)
 
 
 if __name__ == "__main__":

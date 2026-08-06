@@ -6,13 +6,11 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-nawaloka}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nawaloka_dev_pw}
       POSTGRES_DB: ${POSTGRES_DB:-nawaloka}
-      # Consumed by 004_ro_role.sql via psql variable substitution.
       CHATBOT_RO_PASSWORD: ${CHATBOT_RO_PASSWORD:-chatbot_ro_dev_pw}
     ports:
       - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # Scripts run once, in lexical order, on first initialisation of an empty volume.
       - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nawaloka} -d ${POSTGRES_DB:-nawaloka}"]
@@ -30,23 +28,24 @@ services:
     volumes:
       - qdrantdata:/qdrant/storage
     healthcheck:
-      # The qdrant image is distroless - no curl/wget - so probe from the bundled binary instead.
       test: ["CMD", "/qdrant/qdrant", "--version"]
       interval: 10s
       timeout: 5s
       retries: 10
     restart: unless-stopped
 
-  # ---------------------------------------------------------------------------
-  # Application services sit behind the "app" profile, so the default
-  # `docker compose up -d` still brings up only Postgres and Qdrant - which is
-  # what you want while developing against a locally-run backend.
-  #
-  #   docker compose up -d                      infrastructure only
-  #   docker compose --profile app up -d        the whole stack
-  # ---------------------------------------------------------------------------
+  scraper:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.scraper
+    container_name: nawaloka-scraper
+    env_file:
+      - .env
+    volumes:
+      - ./backend/data/raw:/app/data/raw
+    restart: "no"
+
   backend:
-    profiles: ["app"]
     build:
       context: ./backend
     container_name: nawaloka-backend
@@ -54,29 +53,27 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        # Healthy, not merely started: the API seeds the vector store during
-        # startup and would otherwise race Qdrant's own boot.
         condition: service_healthy
+      scraper:
+        condition: service_completed_successfully
+    volumes:
+      - ./backend/data/raw:/app/data/raw:ro
     environment:
-      # Inside the compose network the services are reachable by name, and
-      # Postgres listens on 5432 regardless of the host port mapping.
       DATABASE_URL: postgresql://${POSTGRES_USER:-nawaloka}:${POSTGRES_PASSWORD:-nawaloka_dev_pw}@postgres:5432/${POSTGRES_DB:-nawaloka}
       DATABASE_RO_URL: postgresql://chatbot_ro:${CHATBOT_RO_PASSWORD:-chatbot_ro_dev_pw}@postgres:5432/${POSTGRES_DB:-nawaloka}
       QDRANT_URL: http://qdrant:6333
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
-      LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-groq,gemini}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-groq,gemini,openrouter}
       CORS_ORIGINS: http://localhost:3000
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # Builds the vector index from the committed HTML cache on first start.
-      # Set to false if you would rather seed manually.
       SEED_ON_STARTUP: ${SEED_ON_STARTUP:-true}
     ports:
       - "${BACKEND_PORT:-8001}:8001"
     restart: unless-stopped
 
   frontend:
-    profiles: ["app"]
     build:
       context: ./frontend
       args:
@@ -84,8 +81,6 @@ services:
     container_name: nawaloka-frontend
     depends_on:
       backend:
-        # Waits out the first-boot index build, so the UI never loads against
-        # an API that is not ready to answer.
         condition: service_healthy
     ports:
       - "3000:3000"

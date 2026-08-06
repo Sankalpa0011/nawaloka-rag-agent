@@ -1,14 +1,4 @@
-"""Curated FAQ pairs - the fast path for common patient questions.
-
-Every answer here is grounded in the scraped corpus (`data/extracted/`) or in
-the relational database. Nothing is written from general knowledge: a
-hand-authored FAQ that quietly invents a visiting-hours policy is worse than no
-FAQ at all, because it bypasses retrieval and is answered with full confidence.
-Questions the corpus does not answer are deliberately absent.
-
-`volatility` marks answers that can change. Anything `volatile` is served with
-a "confirm by phone" line, and prices are never hard-coded here - price
-questions are routed to the database instead, which is the system of record.
+"""Curated FAQ pairs (phone numbers, addresses, hours) - fast path for transactional questions.
 
     python -m app.ingest.faq_seed          # build the collection
     python -m app.ingest.faq_seed --test   # check retrieval quality
@@ -19,12 +9,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.config import settings
+from app.contact import HOTLINE as CONTACT_HOTLINE
 from app.logging_conf import get_logger
 
 log = get_logger(__name__)
 
+#Bump on every change to FAQS; ensure_seeded compares this to decide whether
+# to rebuild the collection (so deleted entries don't survive forever).
+FAQ_REVISION = 3
+
 CONTACT_GENERAL = "0115 577 111"
-CONTACT_HOTLINE = "0115 777 777"
 CONTACT_CHANNELING = "011 577 7888"
 CONTACT_ETU = "077 951 1929"
 CONTACT_ADMISSIONS = "076 670 8383"
@@ -48,13 +42,7 @@ class FaqEntry:
     tags: list[str] = field(default_factory=list)
 
     def variants(self) -> list[str]:
-        """Each phrasing indexed separately.
-
-        Concatenating the question and its paraphrases into one embedding
-        dilutes every individual phrasing - measured, "where are you located"
-        then matched the wrong entry entirely. One point per phrasing keeps
-        each one sharp, and they all carry the same answer payload.
-        """
+        """Each phrasing indexed separately, all sharing the same answer payload."""
         return [self.question, *self.paraphrases]
 
 
@@ -93,11 +81,13 @@ FAQS: list[FaqEntry] = [
         tags=["contact"],
     ),
     FaqEntry(
+        # Phrased without the hospital's name on purpose - naming it made this
+        # entry match unrelated "about Nawaloka" questions too broadly.
         id="faq-address",
-        question="Where is Nawaloka Hospital located?",
+        question="Where is the hospital located?",
         paraphrases=[
             "hospital address", "how do I get there", "where are you",
-            "location", "directions",
+            "location", "directions", "how do I find the hospital",
         ],
         answer=f"{ADDRESS}.\n\nGeneral line: **{CONTACT_GENERAL}**.",
         source_urls=["https://www.nawaloka.com/contactus"],
@@ -161,142 +151,15 @@ FAQS: list[FaqEntry] = [
         source_urls=["https://www.nawaloka.com/ambulance-emergency-patient-care"],
         tags=["emergency", "hours"],
     ),
-    FaqEntry(
-        id="faq-international",
-        question="Do you treat international patients?",
-        paraphrases=[
-            "foreign patients", "medical tourism", "overseas patients",
-            "international patient services",
-        ],
-        answer=(
-            "Yes. Nawaloka has a dedicated international patient service that "
-            "supports overseas patients throughout their treatment.\n\n"
-            f"Contact **{CONTACT_HOTLINE}** or email **{EMAIL}** to arrange support."
-        ),
-        source_urls=["https://www.nawaloka.com/international"],
-        tags=["international"],
-    ),
-    FaqEntry(
-        id="faq-about-hospital",
-        question="Tell me about Nawaloka Hospitals",
-        paraphrases=[
-            "do you know nawaloka hospitals", "what is nawaloka hospital",
-            "about the hospital", "who are nawaloka", "nawaloka hospitals",
-            "tell me about this hospital", "what kind of hospital is this",
-        ],
-        answer=(
-            "Nawaloka Hospitals PLC is a private multi-specialty hospital in "
-            "Colombo, Sri Lanka, offering both inpatient and outpatient care.\n\n"
-            "Our centres of excellence include the Heart Centre, Neuro Centre, "
-            "Cancer & Blood Disease Centre, Bone Marrow Transplant Unit, "
-            "Fertility Centre, Mother & Baby unit, Radiology & Imaging and a "
-            "24-hour Accident & Emergency unit.\n\n"
-            "Ask me about a specific centre, a consultant's fee, channeling "
-            "times, a lab test price, or a health check package."
-        ),
-        source_urls=["https://www.nawaloka.com/aboutus"],
-        tags=["about"],
-    ),
-    FaqEntry(
-        id="faq-what-can-you-do",
-        question="What can you help me with?",
-        paraphrases=[
-            "what do you do", "who are you", "how can you help", "your capabilities",
-            # Greetings are indexed here so an opening "hi" gets the capability
-            # list instantly instead of taking the slow SMALLTALK route to the
-            # same answer. Very short strings embed weakly, so several are
-            # listed rather than relying on one to generalise.
-            "hi", "hello", "hey", "good morning", "good afternoon", "start",
-        ],
-        answer=(
-            "I can help you with:\n\n"
-            "- **Doctors** - who practises here, their qualifications and consultation fees\n"
-            "- **Channeling** - which days and times a consultant is available\n"
-            "- **Lab tests** - prices, fasting requirements and report turnaround\n"
-            "- **Health packages** - what each includes and what it costs\n"
-            "- **The hospital** - our centres, services and facilities\n\n"
-            "What would you like to know?"
-        ),
-        tags=["meta"],
-    ),
-    FaqEntry(
-        id="faq-parking",
-        question="Is there parking at the hospital?",
-        paraphrases=["car park", "where do I park", "vehicle parking"],
-        answer=(
-            "Yes, vehicle parking is available at the hospital. For details on "
-            f"access on the day, call **{CONTACT_GENERAL}**."
-        ),
-        volatility="volatile",
-        source_urls=["https://www.nawaloka.com/contactus"],
-        tags=["facilities"],
-    ),
-    FaqEntry(
-        id="faq-lab-turnaround",
-        question="How long do lab results take?",
-        paraphrases=[
-            "when will my report be ready", "test results time", "report delivery",
-        ],
-        answer=(
-            "Most routine tests are reported the same day or within 24 hours, "
-            "depending on the investigation.\n\n"
-            "Tell me which test you need and I can give you its exact reporting "
-            "time from our system."
-        ),
-        source_urls=["https://www.nawaloka.com/laboratory"],
-        tags=["laboratory"],
-    ),
-    FaqEntry(
-        id="faq-health-checks",
-        question="What health check packages do you offer?",
-        paraphrases=[
-            "health screening", "full body checkup", "annual checkup",
-            "wellness package", "medical checkup",
-        ],
-        answer=(
-            "We offer preventive health screening packages for men, women, "
-            "pre-employment and pre-marital checks, and comprehensive cancer "
-            "screening.\n\n"
-            "Ask me about a specific package and I'll give you its exact price "
-            "and everything it includes."
-        ),
-        source_urls=["https://www.nawaloka.com/health-checkups"],
-        tags=["packages"],
-    ),
-    FaqEntry(
-        id="faq-blood-bank",
-        question="Do you have a blood bank?",
-        paraphrases=["donate blood", "blood donation", "blood transfusion service"],
-        answer=(
-            "Yes, Nawaloka operates a blood bank.\n\n"
-            f"For donation or transfusion enquiries call **{CONTACT_GENERAL}**."
-        ),
-        source_urls=["https://www.nawaloka.com/blood-bank"],
-        tags=["services"],
-    ),
-    FaqEntry(
-        id="faq-centres",
-        question="What specialist centres does the hospital have?",
-        paraphrases=[
-            "centres of excellence", "what departments do you have",
-            "specialist units", "list of centres",
-        ],
-        answer=(
-            "Nawaloka's centres of excellence include the Heart Centre, Neuro "
-            "Centre, Cancer & Blood Disease Centre, Bone Marrow Transplant Unit, "
-            "Fertility Centre, Mother & Baby unit, ENT, Dental, Eye Care and "
-            "LASIK, Radiology & Imaging, Diabetes Centre, Rheumatology & Sports "
-            "Medicine, Skin Care & Cosmetic Centre, and the Elite VIP and "
-            "Corporate centres.\n\n"
-            "Ask about any of them and I'll tell you what they offer."
-        ),
-        source_urls=["https://www.nawaloka.com/"],
-        tags=["centres"],
-    ),
 ]
 
+#: Every tag a curated entry is allowed to carry; enforced by test to keep scope narrow.
+TRANSACTIONAL_TAGS = frozenset({
+    "contact", "emergency", "hours", "location", "booking", "admissions",
+    "laboratory", "pharmacy", "channeling",
+})
 
-# ---------------------------------------------------------------------------
+
 def build(recreate: bool = True) -> int:
     from qdrant_client import models
 
@@ -328,13 +191,30 @@ def build(recreate: bool = True) -> int:
                 "volatility": f.volatility,
                 "source_urls": f.source_urls,
                 "tags": f.tags,
+                "faq_revision": FAQ_REVISION,
             },
         )
         for i, ((f, variant), vec) in enumerate(zip(pairs, vectors))
     ]
     client.upsert(collection_name=name, points=points, wait=True)
-    log.info("faq.seeded", collection=name, entries=len(FAQS), points=len(points))
+    log.info("faq.seeded", collection=name, entries=len(FAQS), points=len(points),
+             revision=FAQ_REVISION)
     return len(FAQS)
+
+
+def seeded_revision() -> int | None:
+    """FAQ_REVISION a live collection was built from, or None (meaning "rebuild")."""
+    from app.retrieval.qdrant_store import get_client
+
+    client = get_client()
+    name = settings.qdrant_faq_collection
+    if not client.collection_exists(name):
+        return None
+    points, _ = client.scroll(name, limit=1, with_payload=True, with_vectors=False)
+    if not points:
+        return None
+    revision = (points[0].payload or {}).get("faq_revision")
+    return revision if isinstance(revision, int) else None
 
 
 def main() -> int:
@@ -354,12 +234,20 @@ def main() -> int:
             ("what's the ambulance number", True),
             ("how do I book a doctor", True),
             ("where are you located", True),
-            ("do you take foreign patients", True),
             ("is the ETU open at 3am", True),
+            ("what is the pharmacy number", True),
             # must MISS - these need live data, not a canned answer
             ("what is Dr. Maiya Gunasekara's fee", False),
             ("which doctors work on Tuesday", False),
             ("how much is the dengue test", False),
+            # must MISS - descriptive questions belong to the vector store now.
+            # Each of these used to hit a curated entry and get a brochure.
+            ("do you take foreign patients", False),
+            ("tell me about nawaloka hospitals", False),
+            ("what specialist centres do you have", False),
+            ("what services does the heart centre offer", False),
+            ("what dental treatments do you offer", False),
+            ("do you have a blood bank", False),
             ("what is the capital of France", False),
         ]
         print(f"\n{'query':<44}{'hit':>6}{'score':>8}  entry")

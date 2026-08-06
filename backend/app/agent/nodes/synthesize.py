@@ -1,16 +1,8 @@
-"""Answer synthesis.
+"""Builds the synthesis prompt from SQL/vector evidence and runs the answer LLM call.
 
-Evidence from the two sources is presented to the model in clearly separated,
-labelled blocks, with an explicit precedence rule: **the database wins on
-anything transactional**. That is not a stylistic preference - the website
-advertises health packages that do not exist in the relational database (e.g.
-"Premier Under 40 Men", LKR 45,000), so a model left to blend the two will
-quote a price the hospital's system of record cannot honour.
-
-Tool `notes` are injected verbatim and marked as mandatory. They are how the
-deterministic layer tells the model things it cannot infer from rows alone -
-"this doctor is recorded as 'Daily' and therefore includes Tuesday", "these two
-doctors have no published sessions, do not imply availability".
+DB and documents go in as separate labelled blocks; the database wins on
+anything transactional, and tool `notes` are passed through verbatim as
+mandatory context.
 """
 
 from __future__ import annotations
@@ -21,52 +13,41 @@ import time
 
 from app.agent.guardrail import MEDICAL_DISCLAIMER
 from app.agent.state import AgentState, Citation, trace_event
+from app.config import settings
+from app.contact import HOTLINE
 from app.llm.base import Msg
 from app.llm.router import get_router
 from app.logging_conf import get_logger
+from app.prompts.templates import SYNTHESIZE, render
 
 log = get_logger(__name__)
 
-MAX_ROWS_IN_PROMPT = 25
-MAX_DOC_CHARS = 1100
+MAX_ROWS_IN_PROMPT = settings.synthesis_max_rows_in_prompt
+MAX_DOC_CHARS = settings.synthesis_max_doc_chars
+SYNTHESIS_MAX_TOKENS = settings.synthesis_max_tokens
+SYNTHESIS_RETRY_MAX_TOKENS = settings.synthesis_retry_max_tokens
 
-SYSTEM = """You are the assistant for Nawaloka Hospitals in Colombo, Sri Lanka. \
-Answer patients clearly and warmly, in a few short sentences or a compact list.
+BREVITY_NUDGE = (
+    "\n\nYour previous attempt was cut off before it finished. Answer again, "
+    "much shorter: one line per item, no preamble, no closing paragraph."
+)
 
-EVIDENCE RULES - these override your own knowledge:
-1. Use ONLY the evidence provided. If it does not answer the question, say so.
-2. <database> is the hospital's system of record. For any fee, price, schedule,
-   room, package or test detail, the database is authoritative. If <documents>
-   disagree with it, the database is right and the document is stale.
-3. Never state a price, fee or time that is not present in the evidence.
-4. Text under "notes" is verified fact from the database layer. Follow it
-   exactly and reflect it in your answer.
-5. Quote test preparation instructions (fasting, timing) word for word. Never
-   paraphrase them.
-6. Cite documents inline as [1], [2] using the numbers given. Do not cite the
-   database.
-7. Amounts are Sri Lankan Rupees. Write them as "LKR 3,500".
-8. If nothing supports an answer, say you do not have that information and
-   suggest calling 0115 777 777. Do not guess.
 
-FORMATTING:
-- Keep one item per bullet. A doctor's name, time and room belong on the SAME
-  line, never split into separate bullets - "**Dr. X** (Cardiology) - Monday
-  2:00 PM to 5:00 PM, Room 108".
-- Write times the way people say them: "2:00 PM to 5:00 PM", not "14:00:00".
-- Bold only names and amounts. Do not bold labels like "Time:" or "Location:".
-- No greeting unless the patient greeted you first. Answer the question.
-- Keep it short. A list of three doctors needs three lines, not twelve.
+def _superseded(sql_calls: list[dict]) -> list[dict]:
+    """Drop retry attempts that a later call replaced, keeping only useful ones for the prompt."""
+    useful = [c for c in sql_calls if c.get("rows") and not c.get("error")]
+    if useful:
+        return useful
 
-Never diagnose, never recommend medication or dosage, never interpret a \
-patient's own test results. Pointing someone to the right specialty is fine."""
+    clean = [c for c in sql_calls if not c.get("error")]
+    return (clean or sql_calls)[-1:]
 
 
 def _format_sql(sql_calls: list[dict]) -> str:
     if not sql_calls:
         return ""
     blocks: list[str] = []
-    for call in sql_calls:
+    for call in _superseded(sql_calls):
         if call.get("error"):
             blocks.append(
                 f"[tool {call.get('tool')}] FAILED: {call['error']}\n"
@@ -75,12 +56,13 @@ def _format_sql(sql_calls: list[dict]) -> str:
             continue
 
         rows = call.get("rows") or []
+        shown = settings.synthesis_max_rows_in_prompt
         part = [f"[tool {call.get('tool')}] {len(rows)} row(s)"]
         if rows:
-            part.append(json.dumps(rows[:MAX_ROWS_IN_PROMPT], ensure_ascii=False,
+            part.append(json.dumps(rows[:shown], ensure_ascii=False,
                                    indent=1, default=str))
-            if len(rows) > MAX_ROWS_IN_PROMPT:
-                part.append(f"... {len(rows) - MAX_ROWS_IN_PROMPT} more row(s) not shown")
+            if len(rows) > shown:
+                part.append(f"... {len(rows) - shown} more row(s) not shown")
         else:
             part.append("NO ROWS - the database has no record matching this.")
         for note in call.get("notes") or []:
@@ -104,9 +86,22 @@ def _format_docs(documents: list[dict]) -> tuple[str, list[Citation]]:
                 score=doc.get("rerank_score"),
             )
         )
-        body = (doc.get("body") or "")[:MAX_DOC_CHARS]
+        body = (doc.get("body") or "")[: settings.synthesis_max_doc_chars]
         blocks.append(f"[{i}] {doc.get('citation', '')}\n{body}")
     return "\n\n".join(blocks), citations
+
+
+_MARKER = re.compile(r"\[([\d,\s]+)\]")
+
+
+def cited_indexes(answer: str) -> set[int]:
+    found: set[int] = set()
+    for marker in _MARKER.findall(answer):
+        for number in marker.split(","):
+            number = number.strip()
+            if number.isdigit():
+                found.add(int(number))
+    return found
 
 
 def build_messages(state: AgentState) -> tuple[list[Msg], list[Citation]]:
@@ -115,8 +110,9 @@ def build_messages(state: AgentState) -> tuple[list[Msg], list[Citation]]:
 
     parts: list[str] = []
     if state.get("history"):
-        recent = state["history"][-2:]
-        convo = "\n".join(f"Patient: {u}\nAssistant: {a[:200]}" for u, a in recent)
+        recent = state["history"][-settings.synthesis_history_turns:]
+        limit = settings.synthesis_history_answer_chars
+        convo = "\n".join(f"Patient: {u}\nAssistant: {a[:limit]}" for u, a in recent)
         parts.append(f"<conversation>\n{convo}\n</conversation>")
 
     if sql_block:
@@ -134,8 +130,16 @@ def build_messages(state: AgentState) -> tuple[list[Msg], list[Citation]]:
             "clinic; do not suggest a cause or diagnosis.</framing>"
         )
 
+    # DB empty but docs found: flag it so the model doesn't imply a priced record exists.
+    if state.get("zero_rows") and doc_block:
+        parts.append(
+            "<framing>The database holds no record matching this, and the "
+            "documents below describe what the hospital offers. Rule 11 "
+            "applies.</framing>"
+        )
+
     parts.append(f"Patient's question: {state.get('contextual_query') or state['user_query']}")
-    return [Msg("system", SYSTEM), Msg("user", "\n\n".join(parts))], citations
+    return render(SYNTHESIZE, input="\n\n".join(parts), hotline=HOTLINE), citations
 
 
 #: Numbers that are units rather than money, so they are not price claims.
@@ -144,12 +148,7 @@ _MONEY = re.compile(r"(?:LKR|Rs\.?)\s*([\d,]+(?:\.\d{1,2})?)", re.I)
 
 
 def _unsupported_amounts(answer: str, state: AgentState) -> list[str]:
-    """Money in the answer that appears in no piece of evidence.
-
-    Hallucinated prices are the most damaging failure available in this domain,
-    and they are cheap to detect: every legitimate amount must appear somewhere
-    in the rows or documents that produced the answer.
-    """
+    """Money figures in the answer that don't appear anywhere in the evidence."""
     evidence = json.dumps(state.get("sql_calls") or [], default=str)
     evidence += " ".join((d.get("body") or "") for d in state.get("documents") or [])
     evidence_digits = re.sub(r"[,\s]", "", evidence)
@@ -165,36 +164,123 @@ def _unsupported_amounts(answer: str, state: AgentState) -> list[str]:
     return unsupported
 
 
+def _with_brevity_nudge(messages: list[Msg]) -> list[Msg]:
+    """Copy of the prompt with the brevity nudge appended to the last user message."""
+    out = [Msg(m.role, m.content) for m in messages]
+    for msg in reversed(out):
+        if msg.role == "user":
+            msg.content += BREVITY_NUDGE
+            break
+    return out
+
+
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+_TRAILING_WORD = re.compile(r"(\w+)$")
+
+_ABBREVIATIONS = {"dr", "prof", "mr", "mrs", "ms", "st", "no", "vs", "approx"}
+
+
+def _last_sentence_end(body: str) -> int:
+    """Index just past the last real sentence terminator, or -1 if none."""
+    end = -1
+    for match in _SENTENCE_END.finditer(body):
+        word = _TRAILING_WORD.search(body[: match.start()])
+        if word and word.group(1).lower() in _ABBREVIATIONS:
+            continue
+        end = match.end()
+    return end
+
+
+def _trim_to_boundary(answer: str) -> str:
+    """Cut a still-truncated answer back to its last complete line/sentence; "" if none complete."""
+    body = answer.rstrip()
+    if not body:
+        return body
+    lines = body.split("\n")
+    if len(lines) > 1:
+        # Last line is partial since generation stopped mid-token.
+        return "\n".join(lines[:-1]).rstrip()
+    end = _last_sentence_end(body)
+    return body[:end] if end > 0 else ""
+
+
+def _has_evidence(state: AgentState) -> bool:
+    """Whether there's anything for the model to work from (a zero-row result with notes still counts)."""
+    if state.get("documents"):
+        return True
+    for call in state.get("sql_calls") or []:
+        if call.get("rows") or call.get("notes") or call.get("error"):
+            return True
+    return False
+
+
 async def synthesize_node(state: AgentState) -> dict:
     started = time.perf_counter()
     messages, citations = build_messages(state)
 
-    has_evidence = bool(state.get("sql_calls")) or bool(state.get("documents"))
     rows_found = any((c.get("rows") for c in state.get("sql_calls") or []))
-    abstained = not has_evidence or (not rows_found and not state.get("documents"))
+    # Used for cache eligibility only; doesn't gate whether the model runs.
+    abstained = not rows_found and not state.get("documents")
 
+    if not _has_evidence(state):
+        elapsed = int((time.perf_counter() - started) * 1000)
+        log.info("synthesize.fast_exit", ms=elapsed)
+        return {
+            "answer": f"I couldn't find specific information about that in my current records. Please contact Nawaloka Hospitals on {HOTLINE} for assistance.",
+            "citations": [],
+            "abstained": True,
+            "llm_calls": [],
+            "trace": [trace_event("synthesize", ms=elapsed, status="fast_exit_no_evidence")]
+        }
+
+    flags: list[str] = []
     try:
-        response = await get_router().complete(
+        router = get_router()
+        response = await router.complete(
             messages,
             tier="strong",
-            # Generous, because the Gemini 3.x flash models reason internally
-            # and those thinking tokens are charged against max_output_tokens.
-            # At 800 the reasoning consumed the budget and answers arrived
-            # truncated mid-sentence - a list of 11 doctors stopped at the
-            # second one. The installed google-genai (0.5.0) has no
-            # thinking_config to turn it off, so the budget has to absorb it.
-            max_tokens=2500,
-            temperature=0.2,
+            max_tokens=settings.synthesis_max_tokens,
+            temperature=settings.synthesis_temperature,
         )
+
+        if response.truncated:
+            # Retry once with a shorter target rather than looping.
+            log.warning("synthesize.truncated", attempt=1,
+                        provider=response.provider, model=response.model,
+                        output_tokens=response.usage.output_tokens,
+                        max_tokens=settings.synthesis_max_tokens)
+            flags.append("truncated_retried")
+            response = await router.complete(
+                _with_brevity_nudge(messages),
+                tier="strong",
+                max_tokens=settings.synthesis_retry_max_tokens,
+                temperature=settings.synthesis_temperature,
+            )
+
         answer = response.text.strip()
         llm_trace = response.to_trace()
+
+        if response.truncated:
+            log.warning("synthesize.truncated_after_retry",
+                        provider=response.provider, model=response.model,
+                        output_tokens=response.usage.output_tokens,
+                        max_tokens=settings.synthesis_retry_max_tokens)
+            flags.append("truncated")
+            kept = _trim_to_boundary(answer)
+            answer = (
+                f"{kept}\n\n_This answer was cut short. Please call {HOTLINE} "
+                "for the rest._"
+                if kept
+                else "I could not finish that answer. Please call Nawaloka "
+                     f"Hospitals on {HOTLINE} and they will go through it with you."
+            )
     except Exception as exc:
         log.error("synthesize.failed", error=str(exc)[:200])
         return {
             "answer": (
                 "I'm having trouble reaching my language service right now. "
                 "Please try again in a moment, or call Nawaloka Hospitals on "
-                "0115 777 777."
+                f"{HOTLINE}."
             ),
             "citations": [],
             "abstained": True,
@@ -202,23 +288,21 @@ async def synthesize_node(state: AgentState) -> dict:
             "trace": [trace_event("synthesize", error=str(exc)[:160])],
         }
 
-    # --- post-checks ------------------------------------------------------
-    flags: list[str] = []
     unsupported = _unsupported_amounts(answer, state)
     if unsupported:
         flags.append(f"unsupported_amounts:{','.join(unsupported)}")
         log.warning("synthesize.unsupported_amount", amounts=unsupported)
         answer += (
-            "\n\n_Please confirm current prices with the hospital on 0115 777 777._"
+            f"\n\n_Please confirm current prices with the hospital on {HOTLINE}._"
         )
 
     if state.get("disclaimer_required") and MEDICAL_DISCLAIMER not in answer:
         answer = f"{answer}\n\n{MEDICAL_DISCLAIMER}"
 
     # Only cite documents the answer actually references.
-    used = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
+    used = cited_indexes(answer)
     kept = [c.to_dict() for c in citations if c.index in used] or [
-        c.to_dict() for c in citations[:3]
+        c.to_dict() for c in citations[: settings.synthesis_fallback_citations]
     ]
 
     elapsed = int((time.perf_counter() - started) * 1000)

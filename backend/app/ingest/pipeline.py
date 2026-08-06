@@ -1,15 +1,10 @@
-"""End-to-end ingestion: scrape -> extract -> chunk -> embed -> index.
+"""Whole ingestion run: scrape -> extract -> chunk -> embed -> index.
 
-The default mode rebuilds the index from the committed HTML cache in
-``data/raw`` and touches the network only for model downloads::
+Rebuilds from the committed HTML cache in data/raw by default.
 
     python -m app.ingest.pipeline                 # offline rebuild from cache
     python -m app.ingest.pipeline --scrape        # re-crawl the site first
     python -m app.ingest.pipeline --recreate      # drop and rebuild the collection
-
-Rebuilding from cache is the default on purpose: a grader can reproduce the
-exact corpus this system was built against without depending on nawaloka.com
-being up, unchanged, or reachable from their network.
 """
 
 from __future__ import annotations
@@ -42,7 +37,7 @@ def run(
     started = time.time()
     stages: dict[str, object] = {}
 
-    # --- 1. scrape (optional) ------------------------------------------------
+    # 1. scrape (optional)
     if scrape:
         from app.ingest.scrape import scrape_site
 
@@ -61,7 +56,7 @@ def run(
             "  python -m app.ingest.pipeline --scrape"
         )
 
-    # --- 2. extract ----------------------------------------------------------
+    # 2. extract 
     pages = extract_all()
     thin = [p for p in pages if len(p.markdown) < min_chars]
     if thin:
@@ -72,7 +67,7 @@ def run(
     stages["extract"] = {"pages": len(pages),
                          "chars": sum(len(p.markdown) for p in pages)}
 
-    # --- 3. chunk ------------------------------------------------------------
+    # 3. chunk 
     chunks = chunk_all()
     write_chunks(chunks)
     if not chunks:
@@ -84,7 +79,7 @@ def run(
         "corpus_version": corpus_version,
     }
 
-    # --- 4. embed + index ----------------------------------------------------
+    # 4. embed + index 
     indexed = index_chunks(chunks, collection=collection, recreate=recreate)
     if not recreate:
         prune_stale(collection, corpus_version)

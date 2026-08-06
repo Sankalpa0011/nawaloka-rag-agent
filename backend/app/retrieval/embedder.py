@@ -1,24 +1,4 @@
-"""Embedding models, loaded lazily and shared process-wide.
-
-Everything here runs locally through fastembed (ONNX runtime, no PyTorch).
-That is a deliberate choice: the system already depends on two rate-limited
-LLM providers, and putting embeddings behind a third network quota would mean
-a re-index could fail halfway and retrieval latency would ride on someone
-else's API. Local inference is ~10-30 ms per query on CPU, costs nothing, and
-works offline.
-
-Models
-------
-dense   BAAI/bge-small-en-v1.5   384-dim, cosine. Small, strong on short
-                                 factual passages, and its asymmetric
-                                 query/passage prefixes are handled for us by
-                                 fastembed's query_embed/passage_embed.
-sparse  Qdrant/bm25              Lexical match for exact terms - test codes,
-                                 doctor surnames, "Pap Smear". This is what
-                                 dense vectors are worst at.
-rerank  ms-marco-MiniLM-L-6-v2   Cross-encoder, scores query+passage jointly.
-                                 The single largest precision gain available.
-"""
+"""Embedding models (dense, sparse, rerank), loaded lazily via fastembed (ONNX, local)."""
 
 from __future__ import annotations
 
@@ -26,6 +6,8 @@ import os
 import threading
 from functools import lru_cache
 from typing import Iterable
+
+from llama_index.core.base.embeddings.base import BaseEmbedding
 
 from app.config import settings
 from app.logging_conf import get_logger
@@ -35,14 +17,8 @@ log = get_logger(__name__)
 _lock = threading.Lock()
 
 
+# ONNX intra-op thread count; leaves one thread free for the event loop.
 def _threads() -> int:
-    """ONNX intra-op threads.
-
-    fastembed defaults to letting onnxruntime decide, which under-subscribes on
-    this workload - reranking is the dominant cost in a retrieval call and is
-    embarrassingly parallel across the candidate batch. One thread is left for
-    the event loop so streaming responses are not starved.
-    """
     if settings.onnx_threads > 0:
         return settings.onnx_threads
     return max(1, (os.cpu_count() or 2) - 1)
@@ -79,13 +55,16 @@ def rerank_model():
 DENSE_DIM = 384
 
 
+# Passage side of the model, for indexing documents.
 def embed_passages(texts: Iterable[str]) -> list[list[float]]:
-    """Embed documents for indexing (uses the passage-side representation)."""
-    return [v.tolist() for v in dense_model().passage_embed(list(texts))]
+    out = []
+    for v in dense_model().passage_embed(list(texts)):
+        out.append(v.tolist())
+    return out
 
 
+# Query side of the model, for a user query.
 def embed_query(text: str) -> list[float]:
-    """Embed a user query (uses the query-side representation)."""
     return next(iter(dense_model().query_embed([text]))).tolist()
 
 
@@ -94,26 +73,70 @@ def _to_sparse(emb) -> tuple[list[int], list[float]]:
 
 
 def sparse_passages(texts: Iterable[str]) -> list[tuple[list[int], list[float]]]:
-    return [_to_sparse(e) for e in sparse_model().embed(list(texts))]
+    out = []
+    for e in sparse_model().embed(list(texts)):
+        out.append(_to_sparse(e))
+    return out
 
 
 def sparse_query(text: str) -> tuple[list[int], list[float]]:
-    # BM25 query embedding differs from the document side (no term saturation),
-    # so use query_embed rather than embed here.
+    # query_embed, not embed - BM25 treats the query side differently (no term saturation).
     return _to_sparse(next(iter(sparse_model().query_embed([text]))))
 
 
+# Relevance scores, same order as `documents`.
 def rerank(query: str, documents: list[str]) -> list[float]:
-    """Cross-encoder relevance scores, aligned with *documents* order."""
     if not documents:
         return []
-    return [float(s) for s in rerank_model().rerank(query, documents)]
+    scores = []
+    for s in rerank_model().rerank(query, documents):
+        scores.append(float(s))
+    return scores
 
 
-def warm_up() -> None:
-    """Pre-load models so the first user request is not slowed by cold start."""
+class SharedFastEmbed(BaseEmbedding):
+    """LlamaIndex embedding wrapper that reuses the models loaded above, instead of
+    LlamaIndex loading its own second copy."""
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "SharedFastEmbed"
+
+    def _get_query_embedding(self, query: str) -> list[float]:
+        return embed_query(query)
+
+    def _get_text_embedding(self, text: str) -> list[float]:
+        return embed_passages([text])[0]
+
+    def _get_text_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return embed_passages(texts)
+
+    async def _aget_query_embedding(self, query: str) -> list[float]:
+        return self._get_query_embedding(query)
+
+    async def _aget_text_embedding(self, text: str) -> list[float]:
+        return self._get_text_embedding(text)
+
+
+@lru_cache(maxsize=1)
+def llama_embedding() -> SharedFastEmbed:
+    return SharedFastEmbed()
+
+
+# Load the models (and optionally the retrieval index) up front to avoid a cold start.
+def warm_up(retrieval: bool = True) -> None:
     embed_query("warm up")
     sparse_query("warm up")
     if settings.enable_rerank:
         rerank("warm up", ["warm up"])
+
+    if retrieval:
+        try:
+            from app.retrieval.search import get_index
+
+            get_index(settings.qdrant_collection)
+        except Exception as exc:
+            # Qdrant not up yet, or collection not seeded - not fatal.
+            log.warning("embedder.retrieval_warm_failed", error=str(exc)[:160])
+
     log.info("embedder.warm")

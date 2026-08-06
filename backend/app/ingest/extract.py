@@ -1,32 +1,5 @@
-"""Turn cached raw HTML into clean, structured markdown.
-
-Why not just use trafilatura
-----------------------------
-Trafilatura is the usual right answer and it is still used here as a
-cross-check, but on this site it discards most of the page. Measured across the
-41 cached pages it recovers only ~44% of the visible text, and on
-``/lab-tests-online`` just 304 of 52,002 characters (0.6%).
-
-The cause is structural. The site is built with Chakra UI, which emits no
-semantic containers at all - no ``<main>``, ``<article>`` or ``<section>``,
-only bare ``<div class="css-1p1m4ay">``. Trafilatura's extraction relies on
-those landmarks plus text-density heuristics, so it has nothing to anchor to.
-Content that is a form control rather than prose (the lab-test catalogue is a
-``<select>`` with thousands of ``<option>`` elements) is invisible to it.
-
-So extraction here walks the DOM directly:
-
-1. Drop non-content nodes (script/style/svg) and the chrome landmarks that DO
-   exist (``<nav>``, ``<footer>``).
-2. Flatten the remaining tree to leaf-level text blocks, tagging headings,
-   list items, table rows and ``<select>`` catalogues.
-3. Remove site-wide boilerplate *statistically* rather than with hand-written
-   selectors: any text block that appears on more than ``BOILERPLATE_RATIO``
-   of pages is chrome by definition. This is what removes the phone numbers,
-   the mega-menu and the footer without a brittle list of CSS classes, and it
-   keeps working if the site is restyled.
-4. Emit markdown that preserves heading hierarchy, which the chunker then uses
-   to build breadcrumb-prefixed chunks.
+"""Cached raw HTML -> clean markdown: strip chrome, flatten to blocks, drop
+statistical boilerplate, and render heading-preserving markdown for the chunker.
 """
 
 from __future__ import annotations
@@ -38,18 +11,18 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-from app.config import EXTRACTED_DIR, RAW_HTML_DIR
+from app.config import EXTRACTED_DIR, RAW_HTML_DIR, settings
 from app.logging_conf import get_logger
 
 log = get_logger(__name__)
 
-# Nodes that never contain page content.
+# these never hold page content
 DROP_TAGS = ("script", "style", "noscript", "svg", "iframe", "template")
 
-# Chrome landmarks the site does provide.
+# the chrome landmarks the site actually gives us
 CHROME_TAGS = ("nav", "footer", "header")
 
-# Treated as part of the surrounding text rather than as their own block.
+# part of the surrounding text, not a block of their own
 INLINE_TAGS = {
     "a", "span", "strong", "em", "b", "i", "u", "small", "br", "code",
     "sup", "sub", "abbr", "mark", "label", "img", "figcaption", "time",
@@ -57,14 +30,14 @@ INLINE_TAGS = {
 
 HEADING_TAGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
 
-# A text block seen on more than this fraction of pages is site chrome.
-BOILERPLATE_RATIO = 0.35
+# seen on more than this fraction of pages = site chrome
+BOILERPLATE_RATIO = settings.extract_boilerplate_ratio
 
-# Blocks shorter than this are almost always UI labels ("Read More", "01").
-MIN_BLOCK_CHARS = 3
+# anything shorter is nearly always a UI label - "Read More", "01"
+MIN_BLOCK_CHARS = settings.extract_min_block_chars
 
-# A <select> with at least this many options is a data catalogue, not a form.
-CATALOGUE_MIN_OPTIONS = 25
+# a <select> this big is a data catalogue, not a form control
+CATALOGUE_MIN_OPTIONS = settings.extract_catalogue_min_options
 
 
 @dataclass
@@ -95,7 +68,7 @@ def _norm(text: str) -> str:
 
 
 def _norm_key(text: str) -> str:
-    """Normalised form used for cross-page boilerplate comparison."""
+    """Normalised key for cross-page boilerplate comparison."""
     return re.sub(r"[^a-z0-9 ]+", "", _norm(text).lower())[:120]
 
 
@@ -114,9 +87,9 @@ def _harvest(node: Tag, out: list[Block]) -> None:
             for o in node.find_all("option")
             if _norm(o.get_text(" ", strip=True))
         ]
-        # Drop placeholder entries like "Select a test".
+        # Drop placeholder options like "Select a test".
         options = [o for o in options if not re.fullmatch(r"select( a)?\b.*", o, re.I)]
-        if len(options) >= CATALOGUE_MIN_OPTIONS:
+        if len(options) >= settings.extract_catalogue_min_options:
             out.append(Block("catalogue", "\n".join(options)))
         elif options:
             out.append(Block("para", ", ".join(options)))
@@ -132,16 +105,16 @@ def _harvest(node: Tag, out: list[Block]) -> None:
 
     if not child_blocks:
         text = _norm(node.get_text(" ", strip=True))
-        if len(text) >= MIN_BLOCK_CHARS:
+        if len(text) >= settings.extract_min_block_chars:
             kind = "item" if node.name in {"li", "td", "th"} else "para"
             out.append(Block(kind, text))
         return
 
-    # Text sitting directly on this node, interleaved with child elements.
+    # Text directly on this node, interleaved with child elements.
     direct = _norm(
         "".join(c for c in node.children if isinstance(c, NavigableString))
     )
-    if len(direct) >= MIN_BLOCK_CHARS:
+    if len(direct) >= settings.extract_min_block_chars:
         out.append(Block("para", direct))
 
     for child in child_blocks:
@@ -165,8 +138,7 @@ def page_blocks(html: str) -> tuple[list[Block], str, int]:
     blocks: list[Block] = []
     _harvest(root, blocks)
 
-    # Collapse consecutive duplicates (Chakra renders mobile + desktop copies
-    # of the same node, so the identical text is present twice).
+    # Collapse consecutive duplicates (Chakra renders mobile + desktop copies).
     deduped: list[Block] = []
     seen_in_page: set[str] = set()
     for b in blocks:
@@ -179,8 +151,11 @@ def page_blocks(html: str) -> tuple[list[Block], str, int]:
     return deduped, title, dom_chars
 
 
-def find_boilerplate(pages: dict[str, list[Block]], ratio: float = BOILERPLATE_RATIO) -> set[str]:
-    """Text blocks appearing on more than *ratio* of pages are site chrome."""
+def find_boilerplate(
+    pages: dict[str, list[Block]],
+    ratio: float = settings.extract_boilerplate_ratio,
+) -> set[str]:
+    """Blocks appearing on more than *ratio* of pages are treated as site chrome."""
     counts: dict[str, int] = {}
     for blocks in pages.values():
         for key in {_norm_key(b.text) for b in blocks if b.kind != "catalogue"}:
@@ -194,10 +169,7 @@ def find_boilerplate(pages: dict[str, list[Block]], ratio: float = BOILERPLATE_R
 
 
 def blocks_to_markdown(blocks: list[Block], boilerplate: set[str]) -> tuple[str, int, int]:
-    """Render blocks to markdown, skipping boilerplate.
-
-    Returns (markdown, kept_chars, dropped_boilerplate_blocks).
-    """
+    """Render blocks to markdown, skipping boilerplate. Returns (markdown, kept_chars, dropped)."""
     lines: list[str] = []
     kept = 0
     dropped = 0

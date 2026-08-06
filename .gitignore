@@ -35,8 +35,3 @@ backend/evals/.llm_cache/
 .DS_Store
 Thumbs.db
 *.log
-".env" 
-"__pycache__/" 
-".venv/" 
-"node_modules/" 
-".DS_Store" 

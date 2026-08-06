@@ -11,7 +11,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ---------------------------------------------------------------------------
--- TRAP 1: channeling_sessions.day_of_week is free text, and doctor 6
+-- 1: channeling_sessions.day_of_week is free text, and doctor 6
 --         (Dr. Duminda Pathirana) has the literal value 'Daily' rather than a
 --         weekday name. A naive `WHERE day_of_week = 'Tuesday'` silently drops
 --         him from every weekday query.
@@ -53,10 +53,10 @@ COMMENT ON VIEW v_sessions_expanded IS
     'this view, never through channeling_sessions.day_of_week directly.';
 
 -- ---------------------------------------------------------------------------
--- TRAP 2: doctors 8 (Dr. Usha Samarasinghe) and 9 (Dr. Sandeep K. Sharma) have
+-- 2: doctors 8 (Dr. Usha Samarasinghe) and 9 (Dr. Sandeep K. Sharma) have
 --         no channeling_sessions rows at all. An INNER JOIN drops them from the
 --         directory entirely, which reads as "this doctor does not exist".
--- TRAP 4: names carry honorifics ('Dr.', 'Prof. Arjuna De Silva'), so exact
+-- 4: names carry honorifics ('Dr.', 'Prof. Arjuna De Silva'), so exact
 --         matching on a surname the user typed returns nothing.
 --
 -- v_doctor_directory LEFT JOINs, exposes session_count so callers can state
@@ -90,7 +90,7 @@ COMMENT ON VIEW v_doctor_directory IS
     '= false. name_plain has the honorific stripped for fuzzy matching.';
 
 -- ---------------------------------------------------------------------------
--- TRAP 3: health_packages.included_tests_and_services is a single unstructured
+-- 3: health_packages.included_tests_and_services is a single unstructured
 --         TEXT blob, and its item names do NOT correspond to lab_tests.test_name
 --         (the blob says 'Lipid Profile'; lab_tests has 'Advanced Lipid & ApoB
 --         Profile'). Joining the two tables produces confidently wrong answers.

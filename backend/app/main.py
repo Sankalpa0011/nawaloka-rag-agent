@@ -1,22 +1,5 @@
-"""FastAPI service.
-
-The agent is exposed behind a small, documented HTTP API rather than being
-embedded in the UI, so the UI stays a thin client and the agent can be exercised
-by curl, by tests, or by anything else.
-
-`POST /chat` streams **typed SSE events**, not just answer tokens:
-
-    route       which source was chosen, with confidence and rationale
-    tool_call   which SQL tool ran, and how many rows it returned
-    sources     retrieved chunks with their rerank scores
-    cache       FAQ / semantic-cache hit or miss
-    token       answer text
-    trace       the full per-node trace
-    done        final payload
-    error       something failed
-
-That is what lets the UI render a trace panel showing *why* an answer looks the
-way it does, instead of asking anyone to take the routing on trust.
+"""The FastAPI service. POST /chat streams typed SSE events (route, tool_call,
+sources, cache, token, trace, done, error) so the UI can draw a trace panel.
 """
 
 from __future__ import annotations
@@ -50,10 +33,7 @@ log = get_logger(__name__)
 async def lifespan(app: FastAPI):
     log.info("api.starting")
 
-    # Postgres seeds itself from db/init, but Qdrant comes up empty, so build
-    # the index here on first boot - that keeps `docker compose up` the only
-    # command anyone needs. Idempotent: a restart costs one count query.
-    # Deliberately not fatal; a degraded /health beats an API that won't start.
+    # Build the Qdrant index on first boot if empty; idempotent, non-fatal on failure.
     try:
         from app.ingest.ensure_seeded import ensure_seeded
 
@@ -61,8 +41,7 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.warning("api.seed_failed", error=str(exc)[:200])
 
-    # Warm the ONNX models and compile the graph so the first real request is
-    # not paying a ~5 s cold start.
+    # Warm the ONNX models and compile the graph so the first real request is fast.
     try:
         from app.retrieval.embedder import warm_up
 
@@ -96,9 +75,8 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=2000)
+    message: str = Field(..., min_length=1, max_length=settings.api_max_message_chars)
     thread_id: str | None = Field(None, description="omit to start a new thread")
 
 
@@ -115,7 +93,6 @@ class ChatResponse(BaseModel):
     abstained: bool = False
 
 
-# ---------------------------------------------------------------------------
 @app.get("/health", tags=["ops"])
 async def health() -> dict[str, Any]:
     db = db_health()
@@ -143,13 +120,12 @@ async def root() -> dict[str, str]:
     }
 
 
-# ---------------------------------------------------------------------------
 def _sse(event: str, data: Any) -> dict:
     return {"event": event, "data": json.dumps(data, default=str)}
 
 
 def _events_for(node: str, update: dict) -> list[dict]:
-    """Translate a LangGraph node update into typed SSE events."""
+    """Turn one LangGraph node update into the SSE events the UI expects."""
     events: list[dict] = []
 
     if node == "contextualize":
@@ -212,17 +188,13 @@ def _events_for(node: str, update: dict) -> list[dict]:
     return events
 
 
+# Replays the already-finished answer in small word groups at a readable pace.
 async def _stream_answer(text: str) -> AsyncIterator[str]:
-    """Emit the answer in word groups.
-
-    Synthesis is a single non-streaming call (the answer is post-checked for
-    unsupported prices before anyone sees it), so this replays it at a readable
-    pace rather than dumping a wall of text.
-    """
     words = text.split(" ")
-    for i in range(0, len(words), 4):
-        yield " ".join(words[i : i + 4]) + (" " if i + 4 < len(words) else "")
-        await asyncio.sleep(0.02)
+    step = settings.api_stream_words_per_chunk
+    for i in range(0, len(words), step):
+        yield " ".join(words[i : i + step]) + (" " if i + step < len(words) else "")
+        await asyncio.sleep(settings.api_stream_delay_seconds)
 
 
 @app.post("/chat", tags=["chat"])
@@ -240,15 +212,12 @@ async def chat_stream(request: ChatRequest):
                 for node, update in chunk.items():
                     if not isinstance(update, dict):
                         continue
-                    # In "updates" mode each node yields only its own additions.
-                    # A plain dict.update() therefore REPLACES the accumulating
-                    # lists, leaving the trace with just the last node's event -
-                    # exactly the data the UI panel needs most.
-                    for key in ("trace", "sql_calls", "llm_calls"):
-                        if key in update:
-                            final[key] = (final.get(key) or []) + list(update[key])
-                    final.update({k: v for k, v in update.items()
-                                  if k not in ("trace", "sql_calls", "llm_calls")})
+                    accumulating = ("trace", "sql_calls", "llm_calls")
+                    for key, value in update.items():
+                        if key in accumulating:
+                            final[key] = (final.get(key) or []) + list(value)
+                        else:
+                            final[key] = value
                     for event in _events_for(node, update):
                         yield event
 
@@ -300,7 +269,6 @@ async def chat_sync(request: ChatRequest) -> ChatResponse:
     )
 
 
-# ---------------------------------------------------------------------------
 @app.get("/threads/{thread_id}", tags=["chat"])
 async def get_thread(thread_id: str) -> dict[str, Any]:
     state = store.get_state(thread_id)

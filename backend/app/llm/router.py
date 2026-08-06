@@ -1,23 +1,6 @@
-"""Provider-agnostic LLM entry point with rate limiting and failover.
-
-Every LLM call in the system goes through :meth:`LLMRouter.complete`. Callers
-ask for a *tier* rather than a model:
-
-``fast``    routing, query rewriting, summarising, SQL planning - high volume,
-            latency-sensitive, low reasoning demand.
-``strong``  answer synthesis and Text-to-SQL generation - lower volume, where
-            quality actually shows.
-
-The router maps the tier onto each provider's configured model and walks the
-provider chain until one succeeds. What happens on failure depends on *why*:
-
-* rate limited or transient  -> back off and retry the same provider, then move on
-* bad credentials            -> drop the provider for the process lifetime
-* malformed request          -> stop immediately; another provider will fail too
-
-Every response records which provider served it and whether a fallback
-occurred, so the UI trace panel can show it rather than asking anyone to take
-it on trust.
+"""Single entry point for every LLM call: maps a tier ("fast"/"strong") to a
+provider's model and walks the provider chain on failure, retrying, failing
+over, or dropping a provider depending on the error type.
 """
 
 from __future__ import annotations
@@ -32,7 +15,6 @@ from typing import Any, AsyncIterator
 from app.config import settings
 from app.llm.base import (
     AllProvidersFailedError,
-    AuthError,
     BadRequestError,
     LLMResponse,
     Msg,
@@ -43,6 +25,7 @@ from app.llm.base import (
 )
 from app.llm.providers.gemini import GeminiProvider, check_key_format
 from app.llm.providers.groq import GroqProvider
+from app.llm.providers.openrouter import OpenRouterProvider
 from app.llm.ratelimit import (
     AsyncTokenBucket,
     CircuitBreaker,
@@ -54,24 +37,15 @@ from app.logging_conf import get_logger
 log = get_logger(__name__)
 
 # Attempts per provider before failing over.
-MAX_ATTEMPTS_PER_PROVIDER = 2
+MAX_ATTEMPTS_PER_PROVIDER = settings.llm_max_attempts_per_provider
 
 # How long to wait on a throttled provider when another one is available.
 # Beyond this, failing over is faster than queueing.
-FAILOVER_WAIT_SECONDS = 1.5
+FAILOVER_WAIT_SECONDS = settings.llm_failover_wait_seconds
 
-# Output tokens to reserve against the budget, regardless of how high the
-# caller sets ``max_tokens``.
-#
-# ``max_tokens`` is a *safety ceiling*, not a prediction - synthesis sets 2500
-# purely so Gemini's thinking tokens cannot truncate the visible answer.
-# Charging that ceiling to the budget made a full-directory synthesis estimate
-# 5,045 tokens against Groq's 6,000/min, so it was declared throttled and
-# handed to Gemini, which was 503-ing under load: 52 seconds for an answer Groq
-# produces in under one. The turn that actually ran reported 2,125 tokens
-# total. Reserving a realistic figure and letting ``reconcile`` correct it from
-# the provider's own usage numbers is both more accurate and self-healing.
-OUTPUT_RESERVE_TOKENS = 700
+# Output tokens reserved against the budget regardless of the caller's max_tokens
+# (a safety ceiling, not a prediction); reconcile() corrects it from actual usage.
+OUTPUT_RESERVE_TOKENS = settings.llm_output_reserve_tokens
 
 
 class LLMRouter:
@@ -79,18 +53,24 @@ class LLMRouter:
         available: dict[str, Provider] = {
             "gemini": GeminiProvider(),
             "groq": GroqProvider(),
+            "openrouter": OpenRouterProvider(),
         }
-        rpm = {"gemini": settings.gemini_rpm, "groq": settings.groq_rpm}
+        rpm = {
+            "gemini": settings.gemini_rpm,
+            "groq": settings.groq_rpm,
+            "openrouter": settings.openrouter_rpm,
+        }
 
-        # Token allowances are published per *model*, not per provider, and the
-        # two tiers differ by 2x on Groq (6k for llama-3.1-8b-instant, 12k for
-        # llama-3.3-70b-versatile). Pacing both against the smaller figure
-        # throttles synthesis at half its real allowance.
+        # Token allowances are per model, not per provider, and differ by tier.
         self._tpm: dict[tuple[str, str], int] = {
             ("gemini", "fast"): settings.gemini_tpm,
             ("gemini", "strong"): settings.gemini_tpm_strong,
             ("groq", "fast"): settings.groq_tpm,
             ("groq", "strong"): settings.groq_tpm_strong,
+            # OpenRouter meters free models by request, not token, so these are
+            # set high on purpose - see the note in config.py.
+            ("openrouter", "fast"): settings.openrouter_tpm,
+            ("openrouter", "strong"): settings.openrouter_tpm_strong,
         }
 
         self.providers: list[Provider] = []
@@ -109,7 +89,9 @@ class LLMRouter:
                 log.warning("llm.provider_not_configured", provider=name)
                 continue
             self.providers.append(provider)
-            self.buckets[name] = AsyncTokenBucket(rpm.get(name, 15), name=name)
+            self.buckets[name] = AsyncTokenBucket(
+                rpm.get(name, settings.gemini_rpm), name=name
+            )
             self.breakers[name] = CircuitBreaker(name=name)
             for tier in ("fast", "strong"):
                 self._budget(name, provider.model_for(tier), tier=tier)
@@ -125,24 +107,18 @@ class LLMRouter:
         if warning and "gemini" in [p.name for p in self.providers]:
             log.warning("llm.suspicious_gemini_key", detail=warning)
 
-    # ------------------------------------------------------------------
     def _budget(self, provider: str, model: str, tier: str | None = None) -> TokenBudget:
-        """Token budget for one provider/model pair, created on first use.
-
-        ``tier`` is only needed to look up the configured allowance; once the
-        budget exists it is found by model name alone, so a caller that knows
-        just the model it is about to hit does not have to know its tier.
-        """
+        """Token budget for one provider/model pair, created on first use."""
         key = f"{provider}:{model}"
         existing = self.budgets.get(key)
         if existing is not None:
             return existing
 
-        # Both tiers of every configured provider are created up front, so an
-        # unknown model here means a model nobody declared. Give it the smaller
-        # of the two allowances: pacing too slowly costs latency, pacing too
-        # fast costs 429s.
-        budget = TokenBudget(self._tpm.get((provider, tier or "fast"), 30_000), name=key)
+        # An unknown model gets the smaller of the two tier allowances.
+        budget = TokenBudget(
+            self._tpm.get((provider, tier or "fast"), settings.llm_default_tpm),
+            name=key,
+        )
         self.budgets[key] = budget
         return budget
 
@@ -163,7 +139,6 @@ class LLMRouter:
             },
         }
 
-    # ------------------------------------------------------------------
     async def complete(
         self,
         messages: list[Msg] | list[dict],
@@ -171,8 +146,8 @@ class LLMRouter:
         tier: Tier = "fast",
         json_schema: dict[str, Any] | None = None,
         temperature: float = 0.0,
-        max_tokens: int = 1024,
-        timeout: float = 45.0,
+        max_tokens: int = settings.llm_default_max_tokens,
+        timeout: float = settings.llm_request_timeout_seconds,
     ) -> LLMResponse:
         msgs = _coerce(messages)
         if not self.providers:
@@ -203,20 +178,14 @@ class LLMRouter:
 
             model = provider.model_for(tier)
 
-            for attempt in range(1, MAX_ATTEMPTS_PER_PROVIDER + 1):
+            for attempt in range(1, settings.llm_max_attempts_per_provider + 1):
                 total_attempts += 1
                 try:
-                    # Waiting only makes sense when there is nothing better to
-                    # do. If an *untried* provider remains, a throttled one
-                    # should be abandoned quickly rather than queued behind:
-                    # Groq's 6k TPM fills in seconds while Gemini's 250k TPM
-                    # sits idle. But on the last remaining provider, waiting
-                    # out the throttle is far better than failing the turn -
-                    # checking "any other provider exists" instead of "any
-                    # untried provider remains" makes every provider bail early
-                    # and collapses the agent onto its no-LLM fallback.
+                    # Fail over fast if an untried provider remains; otherwise wait it out.
                     untried = [n for n in eligible if n != name]
-                    wait_budget = FAILOVER_WAIT_SECONDS if untried else timeout
+                    wait_budget = (
+                        settings.llm_failover_wait_seconds if untried else timeout
+                    )
 
                     waited = await self.buckets[name].acquire(timeout=wait_budget)
 
@@ -224,7 +193,7 @@ class LLMRouter:
                     # budget is checked in addition to the request bucket.
                     estimated = estimate_tokens(
                         [m.content for m in msgs],
-                        max_output=min(max_tokens, OUTPUT_RESERVE_TOKENS),
+                        max_output=min(max_tokens, settings.llm_output_reserve_tokens),
                     )
                     budget = self._budget(name, model)
                     waited += await budget.acquire(estimated, timeout=wait_budget)
@@ -262,24 +231,12 @@ class LLMRouter:
                     return response
 
                 except TimeoutError as exc:
-                    # Throttled, not broken. Do NOT record a breaker failure -
-                    # a provider that is merely at its quota must not be
-                    # circuit-opened for a minute; it will be usable again in
-                    # seconds and is still the preferred choice.
+                    # Throttled, not broken - don't record a breaker failure for this.
                     errors[name] = f"throttled: {exc}"
                     log.info("llm.throttled_failing_over", provider=name,
                              untried=untried, detail=str(exc)[:120])
                     if name in eligible:
                         eligible.remove(name)
-                    break
-
-                except AuthError as exc:
-                    # No amount of retrying fixes a bad key. Take it out of
-                    # rotation so every later turn skips it instantly.
-                    self.disabled[name] = str(exc)
-                    errors[name] = f"auth: {exc}"
-                    log.error("llm.provider_disabled", provider=name,
-                              reason=str(exc)[:200])
                     break
 
                 except BadRequestError as exc:
@@ -288,9 +245,20 @@ class LLMRouter:
                     raise
 
                 except ProviderError as exc:
+                    if exc.fatal_for_provider:
+                        # Bad key or unusable model id: not retryable, drop the provider.
+                        self.disabled[name] = str(exc)
+                        errors[name] = f"{type(exc).__name__}: {exc}"
+                        log.error("llm.provider_disabled", provider=name,
+                                  reason=str(exc)[:200])
+                        break
+
                     errors[name] = f"{type(exc).__name__}: {exc}"
                     breaker.record_failure()
-                    if not exc.retryable or attempt == MAX_ATTEMPTS_PER_PROVIDER:
+                    if (
+                        not exc.retryable
+                        or attempt == settings.llm_max_attempts_per_provider
+                    ):
                         log.warning("llm.failing_over", provider=name,
                                     error=str(exc)[:160])
                         break
@@ -301,7 +269,6 @@ class LLMRouter:
 
         raise AllProvidersFailedError(errors)
 
-    # ------------------------------------------------------------------
     async def complete_json(
         self,
         messages: list[Msg] | list[dict],
@@ -309,36 +276,24 @@ class LLMRouter:
         *,
         tier: Tier = "fast",
         temperature: float = 0.0,
-        max_tokens: int = 1024,
+        max_tokens: int = settings.llm_default_max_tokens,
     ) -> tuple[dict, LLMResponse]:
-        """Structured output with tolerant parsing.
-
-        Even in JSON mode models wrap output in code fences or add a sentence of
-        preamble often enough that strict ``json.loads`` is a real source of
-        turn failures. Salvaging the outermost object is cheaper and safer than
-        spending another request on a retry.
-        """
+        """Structured output with tolerant parsing (handles fenced/preambled JSON)."""
         response = await self.complete(
             messages, tier=tier, json_schema=json_schema,
             temperature=temperature, max_tokens=max_tokens,
         )
         return parse_json_loose(response.text), response
 
-    # ------------------------------------------------------------------
     async def stream(
         self,
         messages: list[Msg] | list[dict],
         *,
         tier: Tier = "strong",
         temperature: float = 0.0,
-        max_tokens: int = 1024,
+        max_tokens: int = settings.llm_default_max_tokens,
     ) -> AsyncIterator[str]:
-        """Stream deltas from the first provider that yields a token.
-
-        Failover only applies *before* the first token: once text has reached
-        the user, switching providers mid-answer would duplicate or contradict
-        what they have already read.
-        """
+        """Stream deltas from the first provider that yields a token; no failover after the first token."""
         msgs = _coerce(messages)
         errors: dict[str, str] = {}
 
@@ -350,7 +305,9 @@ class LLMRouter:
             model = provider.model_for(tier)
             emitted = False
             try:
-                await self.buckets[name].acquire(timeout=30.0)
+                await self.buckets[name].acquire(
+                    timeout=settings.llm_stream_timeout_seconds
+                )
                 async for delta in provider.stream(
                     msgs, model, temperature=temperature, max_tokens=max_tokens
                 ):
@@ -361,7 +318,7 @@ class LLMRouter:
             except Exception as exc:
                 self.breakers[name].record_failure()
                 errors[name] = str(exc)
-                if isinstance(exc, AuthError):
+                if isinstance(exc, ProviderError) and exc.fatal_for_provider:
                     self.disabled[name] = str(exc)
                 if emitted:
                     log.error("llm.stream_failed_midway", provider=name,
@@ -373,7 +330,6 @@ class LLMRouter:
         raise AllProvidersFailedError(errors)
 
 
-# ---------------------------------------------------------------------------
 def _coerce(messages: list[Msg] | list[dict]) -> list[Msg]:
     out: list[Msg] = []
     for m in messages:
@@ -381,38 +337,46 @@ def _coerce(messages: list[Msg] | list[dict]) -> list[Msg]:
     return out
 
 
+# exponential backoff with jitter, but use Retry-After if the provider sent one
 def _backoff(attempt: int, exc: ProviderError) -> float:
-    """Exponential backoff with jitter, honouring Retry-After when present."""
     if isinstance(exc, RateLimitError) and exc.retry_after:
-        return min(float(exc.retry_after), 30.0)
-    return min(2.0**attempt, 20.0) * (0.5 + random.random() / 2)
+        return min(float(exc.retry_after), settings.llm_max_retry_after_seconds)
+    return min(2.0**attempt, settings.llm_max_backoff_seconds) * (
+        0.5 + random.random() / 2
+    )
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
 
+# Models wrap JSON in markdown fences, or add a sentence before it, or both.
+# Try the most likely shapes in order and take the first one that parses.
 def parse_json_loose(text: str) -> dict:
-    """Best-effort extraction of a JSON object from a model response."""
     if not text or not text.strip():
         raise ValueError("empty response, expected JSON")
 
-    candidates = [text.strip()]
+    candidates = []
 
+    # fenced block first - if there is one it's almost always the real payload
     fenced = _FENCE_RE.search(text)
     if fenced:
-        candidates.insert(0, fenced.group(1).strip())
+        candidates.append(fenced.group(1).strip())
 
-    start, end = text.find("{"), text.rfind("}")
+    candidates.append(text.strip())
+
+    # last resort: grab everything between the outermost braces
+    start = text.find("{")
+    end = text.rfind("}")
     if start != -1 and end > start:
-        candidates.append(text[start : end + 1])
+        candidates.append(text[start:end + 1])
 
     for candidate in candidates:
         try:
             parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
         except json.JSONDecodeError:
             continue
+        if isinstance(parsed, dict):
+            return parsed
 
     raise ValueError(f"could not parse JSON from response: {text[:200]!r}")
 

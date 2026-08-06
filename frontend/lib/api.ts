@@ -1,7 +1,5 @@
 // Talks to the FastAPI backend.
-//
-// The browser's built-in EventSource only does GET, and the chat endpoint needs
-// a POST body, so the SSE stream is parsed by hand off fetch().
+// EventSource can't do POST, so the chat SSE stream is parsed by hand off fetch().
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 

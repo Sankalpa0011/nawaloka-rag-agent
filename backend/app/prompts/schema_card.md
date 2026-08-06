@@ -1,4 +1,8 @@
-# Nawaloka Hospitals - database schema
+# Nawaloka Hospitals - notes on the schema above
+
+The DDL above is read from the live database, so it is always current. What
+follows is everything it cannot tell you: which relation to reach for, and the
+four places where the obvious query returns a confidently wrong answer.
 
 You are writing **PostgreSQL SELECT statements** against the hospital's
 operational database. All monetary values are **Sri Lankan Rupees (LKR)**.
@@ -6,7 +10,7 @@ operational database. All monetary values are **Sri Lankan Rupees (LKR)**.
 ## Hard rules
 
 1. Emit exactly **one** `SELECT` statement. No semicolons, no DDL, no writes.
-2. Only the relations listed below. Anything else is rejected before execution.
+2. Only the relations in the DDL above. Anything else is rejected before execution.
 3. Prefer the **views** - they resolve known data hazards that the base tables
    do not. Reading `channeling_sessions` or `doctors` directly is usually a bug.
 4. Always `LIMIT`. 200 is the hard ceiling and is applied automatically.
@@ -16,55 +20,35 @@ operational database. All monetary values are **Sri Lankan Rupees (LKR)**.
 
 ---
 
-## Views - use these first
+## Which relation to reach for
 
 ### `v_doctor_directory` - the complete doctor list
-| column | notes |
-|---|---|
-| `doctor_id` | |
-| `doctor_name` | includes the honorific: `Dr. …`, `Prof. …` |
-| `name_plain` | honorific stripped - **match surnames against this** |
-| `specialty`, `department` | |
-| `qualifications` | free text |
-| `consultation_fee` | numeric, LKR 2500-4500 |
-| `session_count` | number of channeling sessions on record |
-| `has_published_sessions` | **false for 2 of the 11 doctors** |
-| `available_days` | raw `day_of_week` values, may contain `'Daily'` |
-
 Built with a `LEFT JOIN`, so every doctor appears - including the two with no
-sessions at all. Never filter this through an inner join to
+sessions at all. Never filter it through an inner join to
 `channeling_sessions`; that silently deletes them from the answer.
 
-### `v_sessions_expanded` - one row per session **per concrete weekday**
-| column | notes |
-|---|---|
-| `session_id`, `doctor_id`, `doctor_name` | |
-| `specialty`, `department`, `consultation_fee` | |
-| `day_of_week_raw` | the value as stored, e.g. `'Daily'` |
-| `weekday` | **always a real weekday name - filter on this** |
-| `is_recurring_daily` | true when the row came from a `'Daily'` schedule |
-| `start_time`, `end_time`, `room_number`, `max_patients` | |
+- `name_plain` is `doctor_name` with the honorific stripped. **Match surnames
+  against this one.**
+- `has_published_sessions` is **false for 2 of the 11 doctors**.
+- `available_days` holds the raw `day_of_week` values, so it may contain `'Daily'`.
 
-**This is the only correct way to answer "who is available on <day>".**
+### `v_sessions_expanded` - one row per session **per concrete weekday**
+**The only correct way to answer "who is available on \<day\>".**
+
+- `weekday` is always a real weekday name. **Filter on this**, never on
+  `day_of_week_raw`, which still reads `'Daily'` for one doctor.
+- `is_recurring_daily` marks the rows expanded out of a `'Daily'` schedule.
 
 ### `v_package_services` - package contents, one row per listed service
-| column | notes |
-|---|---|
-| `package_id`, `package_name`, `category`, `price`, `target_audience` | |
-| `service_item` | a single service, e.g. `Pap Smear`, `Lipid Profile` |
-
-Use this to answer "which package includes X". **Do not join `service_item` to
+`service_item` is a single service, e.g. `Pap Smear`. This is how you answer
+"which package includes X". **Do not join `service_item` to
 `lab_tests.test_name`** - see hazard 3.
 
----
-
-## Base tables
-
-`specialties(id, name, department)` - 10 rows
-`doctors(id, name, specialty_id → specialties.id, qualifications, consultation_fee)` - 11 rows
-`channeling_sessions(id, doctor_id → doctors.id, day_of_week, start_time, end_time, room_number, max_patients)` -15 rows
-`lab_tests(id, test_code UNIQUE, test_name, category, price, fasting_required_hours, preparation_instructions, report_delivery_hours)` - 17 rows
-`health_packages(id, package_name, category, price, target_audience, included_tests_and_services)` - 11 rows
+### Base tables
+10 specialties, 11 doctors, 15 channeling sessions, 17 lab tests, 11 health
+packages. `lab_tests` and `health_packages` are fine to read directly. Reading
+`doctors` or `channeling_sessions` directly is usually a bug - the views exist
+because those two carry the hazards below.
 
 ---
 
