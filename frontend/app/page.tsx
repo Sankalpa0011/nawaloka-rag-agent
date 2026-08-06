@@ -172,52 +172,56 @@ export default function Page() {
         </span>
       </header>
 
-      {/* is-empty centres the welcome block when there's no thread yet. */}
-      <div
-        className={`messages${messages.length === 0 ? " is-empty" : ""}`}
-        ref={listRef}
-      >
-        {messages.length === 0 && (
-          <div className="welcome">
-            <h2>How can I help you today?</h2>
-            <p>
-              Ask about a doctor&apos;s fee, when a consultant channels, what a
-              lab test costs, or what one of our centres offers.
-            </p>
-            <div className="examples">
-              {EXAMPLES.map((q) => (
-                <button key={q} onClick={() => send(q)}>
-                  {q}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {messages.map((m, i) => (
-          <div key={i} className={`msg ${m.role}`}>
-            {/* User messages are bubbles; assistant answers are plain text. */}
-            {m.role === "assistant" ? (
-              <div className="answer">
-                {m.text ? <Markdown text={m.text} /> : "…"}
+      {/* .messages is the full-width scrolling element (so its scrollbar
+          sits at the browser edge); .messages-inner is the capped, centred
+          content that scrolls inside it. is-empty centres the welcome block
+          when there's no thread yet. */}
+      <div className="messages" ref={listRef}>
+        <div
+          className={`messages-inner${messages.length === 0 ? " is-empty" : ""}`}
+        >
+          {messages.length === 0 && (
+            <div className="welcome">
+              <h2>How can I help you today?</h2>
+              <p>
+                Ask about a doctor&apos;s fee, when a consultant channels, what a
+                lab test costs, or what one of our centres offers.
+              </p>
+              <div className="examples">
+                {EXAMPLES.map((q) => (
+                  <button key={q} onClick={() => send(q)}>
+                    {q}
+                  </button>
+                ))}
               </div>
-            ) : (
-              <div className="bubble">{m.text}</div>
-            )}
-            {m.role === "assistant" && m.details && (
-              <MessageMeta message={m} />
-            )}
-          </div>
-        ))}
+            </div>
+          )}
 
-        {busy && !streaming && (
-          <div className="thinking" aria-label="Thinking">
-            <span />
-            <span />
-            <span />
-          </div>
-        )}
-        {error && <div className="error">{error}</div>}
+          {messages.map((m, i) => (
+            <div key={i} className={`msg ${m.role}`}>
+              {/* User messages are bubbles; assistant answers are plain text. */}
+              {m.role === "assistant" ? (
+                <div className="answer">
+                  {m.text ? <Markdown text={m.text} /> : "…"}
+                </div>
+              ) : (
+                <div className="bubble">{m.text}</div>
+              )}
+              {m.role === "assistant" && m.details && (
+                <MessageMeta message={m} />
+              )}
+            </div>
+          ))}
+
+          {busy && !streaming && (
+            <div className="thinking" aria-label="Thinking">
+              <span />
+              <span />
+              <span />
+            </div>
+          )}
+          {error && <div className="error">{error}</div>}
+        </div>
       </div>
 
       <form

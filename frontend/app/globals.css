@@ -39,13 +39,14 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* The shell always spans the viewport; width is capped and centred per
-   breakpoint below rather than fixed once for every screen size. */
+/* The outer shell is always full-bleed (so its scrollbar sits at the true
+   viewport edge); the capped, centred width lives on the content wrappers
+   inside it (header, .messages-inner, form.composer) via these variables,
+   which the breakpoints below simply override. */
 .page {
+  --shell-max: 1300px;
+  --shell-pad: clamp(24px, 3vw, 48px);
   width: 100%;
-  max-width: 1300px;
-  margin: 0 auto;
-  padding: 0 clamp(24px, 3vw, 48px);
   display: flex;
   flex-direction: column;
   /* dvh accounts for mobile browser chrome; vh is the fallback. */
@@ -56,8 +57,12 @@ body {
 
 /* --- header ------------------------------------------------------------- */
 header {
+  width: 100%;
+  max-width: var(--shell-max);
+  margin: 0 auto;
+  box-sizing: border-box;
   border-bottom: 1px solid var(--border-soft);
-  padding: 22px 0 14px;
+  padding: 22px var(--shell-pad) 14px;
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -105,22 +110,34 @@ header p {
 }
 
 /* --- messages ---------------------------------------------------------- */
+/* This is the actual scrolling element: full width so its scrollbar sits at
+   the browser edge, not at the edge of the centred content. */
 .messages {
+  width: 100%;
   flex: 1;
   overflow-y: auto;
   /* Without min-height:0 a flex child refuses to shrink below its content,
      so the list overflows the page instead of scrolling inside it. */
   min-height: 0;
-  padding: 28px 0 8px;
   scrollbar-width: thin;
   scrollbar-color: #dcdfe3 transparent;
 }
 
-/* With no thread yet there is nothing to scroll, so the container becomes a
-   centring box for the welcome block instead. */
-.messages.is-empty {
+/* The capped, centred content that scrolls inside .messages. */
+.messages-inner {
+  width: 100%;
+  max-width: var(--shell-max);
+  margin: 0 auto;
+  box-sizing: border-box;
+  padding: 28px var(--shell-pad) 8px;
+  min-height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+/* With no thread yet there is nothing to scroll, so the container becomes a
+   centring box for the welcome block instead. */
+.messages-inner.is-empty {
   justify-content: center;
   align-items: center;
   text-align: center;
@@ -425,7 +442,11 @@ pre.sql {
 
 /* --- composer ---------------------------------------------------------- */
 form.composer {
-  padding: 8px 0 16px;
+  width: 100%;
+  max-width: var(--shell-max);
+  margin: 0 auto;
+  box-sizing: border-box;
+  padding: 8px var(--shell-pad) 16px;
   flex-shrink: 0;
 }
 
@@ -554,23 +575,24 @@ form.composer {
 /* Laptop: 1024px - 1199px - proportionally narrower, still centred. */
 @media (max-width: 1199px) {
   .page {
-    max-width: 960px;
-    padding: 0 clamp(20px, 3vw, 32px);
+    --shell-max: 960px;
+    --shell-pad: clamp(20px, 3vw, 32px);
   }
 }
 
 /* Tablet: 768px - 1023px - nearly full width, tighter spacing. */
 @media (max-width: 1023px) {
   .page {
-    max-width: 100%;
-    padding: 0 20px;
+    --shell-max: 100%;
+    --shell-pad: 20px;
   }
 
   header {
-    padding: 18px 0 12px;
+    padding-top: 18px;
+    padding-bottom: 12px;
   }
 
-  .messages {
+  .messages-inner {
     padding-top: 22px;
   }
 }
@@ -578,7 +600,7 @@ form.composer {
 /* Mobile: <768px - full-screen chat, no outer margins. */
 @media (max-width: 767px) {
   .page {
-    padding: 0;
+    --shell-pad: 0px;
   }
 
   header {
@@ -588,7 +610,7 @@ form.composer {
     padding: 14px 16px 12px;
   }
 
-  .messages {
+  .messages-inner {
     padding: 20px 16px 8px;
   }
 
