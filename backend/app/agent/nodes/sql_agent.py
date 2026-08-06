@@ -128,6 +128,32 @@ def _recognised(value: str) -> bool:
         return False
 
 
+# Which argument carries the doctor's name on each doctor tool.
+_DOCTOR_NAME_ARG = {"find_doctors": "name", "get_doctor_schedule": "doctor"}
+
+
+def _restore_named_doctor(tool: str, args: dict[str, Any], question: str) -> dict[str, Any]:
+    field = _DOCTOR_NAME_ARG.get(tool)
+    if not field or args.get(field):
+        return args
+
+    try:
+        from app.agent.signals import extract_signals
+
+        named = extract_signals(question).entities.get("doctor") or []
+    except Exception as exc:
+        log.warning("sql_agent.gazetteer_unavailable", error=str(exc)[:160])
+        return args
+
+    if len(named) != 1:
+        return args
+
+    args = dict(args)
+    args[field] = named[0]
+    log.info("sql_agent.restored_doctor_name", tool=tool, doctor=named[0])
+    return args
+
+
 def _names_something_specific(value: str) -> bool:
     """Whether this phrase points at a particular record vs. a whole topic."""
     text = (value or "").strip().lower()
@@ -305,6 +331,10 @@ async def sql_agent_node(state: AgentState) -> dict:
         reason = "dynamic text2sql fallback due to tool choice failure"
         provider = "system-dynamic"
         
+    # The rewritten intent can drop the name the patient actually typed, so look
+    # for it in both. Entity names come back de-duplicated, so overlap is fine.
+    args = _restore_named_doctor(tool, args, f"{question} {state['user_query']}")
+
     log.info("sql_agent.tool_chosen", tool=tool, args=args, provider=provider,
              attempt=attempt)
 

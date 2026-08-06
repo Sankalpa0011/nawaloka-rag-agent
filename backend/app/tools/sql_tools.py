@@ -230,6 +230,33 @@ def _resolve_department(text: str) -> str | None:
 def reset_specialty_cache() -> None:
     _vocabulary.cache_clear()
 
+def _name_clause(name: str, params: dict[str, Any], *, broad: bool = True,
+                 prefix: str = "name") -> str:
+    column = "d.name_plain"
+    parts = [
+        f"({column} ILIKE :{prefix} OR d.doctor_name ILIKE :{prefix} "
+        f"OR similarity({column}, :{prefix}_raw) > :{prefix}_sim)"
+    ]
+    params[prefix] = f"%{name}%"
+    params[f"{prefix}_raw"] = name
+    params[f"{prefix}_sim"] = settings.sql_name_similarity
+
+    if broad:
+        # Honorifics are stripped by name_plain, so they are noise as query
+        # words too - they would match every doctor in the table.
+        words = [w for w in _words(name) if w not in {"dr", "prof", "doctor"}]
+        if words:
+            params[f"{prefix}_wsim"] = settings.sql_name_word_similarity
+        for i, word in enumerate(words):
+            key = f"{prefix}_w{i}"
+            parts.append(
+                f"({column} ILIKE :{key} OR word_similarity(:{key}_raw, {column}) > :{prefix}_wsim)"
+            )
+            params[key] = f"%{word}%"
+            params[f"{key}_raw"] = word
+
+    return "(" + " OR ".join(parts) + ")"
+
 
 def _run(tool: str, sql: str, params: dict[str, Any]) -> SqlToolResult:
     try:
@@ -286,13 +313,7 @@ def find_doctors(
             where.append("(d.department ILIKE :department OR d.specialty ILIKE :department)")
             params["department"] = f"%{department}%"
     if name:
-        where.append(
-            "(d.name_plain ILIKE :name OR d.doctor_name ILIKE :name "
-            "OR similarity(d.name_plain, :name_raw) > :nsim)"
-        )
-        params["name"] = f"%{name}%"
-        params["name_raw"] = name
-        params["nsim"] = settings.sql_name_similarity
+        where.append(_name_clause(name, params))
     if max_fee is not None:
         where.append("d.consultation_fee <= :max_fee")
         params["max_fee"] = float(max_fee)
@@ -306,10 +327,12 @@ def find_doctors(
 
     clause = " AND ".join(where) if where else "TRUE"
 
-    # Sessions always come back (an opt-in flag let the model see session_count
-    # without the actual days and invent a schedule). COALESCE avoids a null
-    # sessions key, which invites the same guessing as a missing one.
-    # NB: CAST(...AS text), not `::text` - SQLAlchemy's text() binds on `:`.
+    order_by = (
+        "similarity(d.name_plain, :name_raw) DESC, d.doctor_name"
+        if name
+        else "d.consultation_fee ASC, d.doctor_name"
+    )
+
     schedule_select = """,
         COALESCE((SELECT json_agg(json_build_object(
                     'day_of_week', s.day_of_week_raw,
@@ -332,13 +355,29 @@ def find_doctors(
                d.session_count, d.has_published_sessions{schedule_select}
         FROM v_doctor_directory d
         WHERE {clause}
-        ORDER BY d.consultation_fee ASC, d.doctor_name
+        ORDER BY {order_by}
         LIMIT :limit
     """
 
     result = _run("find_doctors", sql, params)
     if result.error:
         return result
+
+    if not result.rows and name and day:
+        without_day = find_doctors(
+            specialty=specialty, name=name, department=department, weekday=None,
+            max_fee=max_fee, limit=limit,
+        )
+        if without_day.rows and not without_day.error:
+            without_day.relaxed = True
+            without_day.notes.insert(
+                0,
+                f"This doctor IS in the database but has NO {day} session. The rows "
+                f"below are their full schedule, not {day} availability. Say plainly "
+                f"that they do not channel on {day}, then give the days they do. "
+                "Never say there is no record of them.",
+            )
+            return without_day
 
     _annotate_doctors(result, weekday=day)
     if day:
@@ -353,7 +392,9 @@ def find_doctors(
 
 def get_doctor_schedule(doctor: str) -> SqlToolResult:
     """Full channeling schedule for one doctor, matched fuzzily by name."""
-    sql = """
+    params: dict[str, Any] = {"limit": settings.sql_doctor_schedule_limit}
+    clause = _name_clause(doctor, params)
+    sql = f"""
         SELECT d.doctor_id, d.doctor_name, d.specialty, d.department,
                d.consultation_fee, d.session_count, d.has_published_sessions,
                (SELECT json_agg(json_build_object(
@@ -367,24 +408,13 @@ def get_doctor_schedule(doctor: str) -> SqlToolResult:
                        ORDER BY s.weekday, s.start_time)
                 FROM v_sessions_expanded s WHERE s.doctor_id = d.doctor_id
                ) AS sessions,
-               similarity(d.name_plain, :q) AS match_score
+               similarity(d.name_plain, :name_raw) AS match_score
         FROM v_doctor_directory d
-        WHERE d.name_plain ILIKE :like
-           OR d.doctor_name ILIKE :like
-           OR similarity(d.name_plain, :q) > :sim
-        ORDER BY similarity(d.name_plain, :q) DESC
+        WHERE {clause}
+        ORDER BY similarity(d.name_plain, :name_raw) DESC
         LIMIT :limit
     """
-    result = _run(
-        "get_doctor_schedule",
-        sql,
-        {
-            "q": doctor,
-            "like": f"%{doctor}%",
-            "sim": settings.sql_name_similarity,
-            "limit": settings.sql_doctor_schedule_limit,
-        },
-    )
+    result = _run("get_doctor_schedule", sql, params)
     if result.error:
         return result
 

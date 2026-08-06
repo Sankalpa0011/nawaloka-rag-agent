@@ -368,6 +368,16 @@ class Settings(BaseSettings):
             "typos and partial surnames without dragging in unrelated doctors."
         ),
     )
+    sql_name_word_similarity: float = Field(
+        default=0.45,
+        description=(
+            "pg_trgm floor for matching a single query word against the best-matching "
+            "run inside a doctor's name (word_similarity). Higher than the whole-string "
+            "floor because a lone word is weak evidence: 'gunasekera' scores 0.64 "
+            "against Gunasekara but still 0.36 against Gunawardena, and only a floor "
+            "between the two keeps broad matching from dragging in a different doctor."
+        ),
+    )
     sql_specialty_threshold: float = Field(
         default=0.80,
         description=(
