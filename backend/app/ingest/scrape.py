@@ -216,9 +216,25 @@ async def _render_one(context, url: str, attempt: int) -> tuple[str, str, str]:
             ),
         )
 
+        # await page.goto(url, wait_until="domcontentloaded", timeout=settings.scrape_timeout_ms)
+        # await page.wait_for_selector(HYDRATION_SELECTOR, state="attached",
+        #                              timeout=settings.scrape_timeout_ms)
+
         await page.goto(url, wait_until="domcontentloaded", timeout=settings.scrape_timeout_ms)
-        await page.wait_for_selector(HYDRATION_SELECTOR, state="attached",
-                                     timeout=settings.scrape_timeout_ms)
+        
+        # Wait for the root element
+        await page.wait_for_selector("#root", state="attached", timeout=settings.scrape_timeout_ms)
+        
+        # Wait for actual text content to load (bypassing the loading spinner)
+        try:
+            min_chars = settings.scrape_min_rendered_chars
+            await page.wait_for_function(
+                f"() => document.body && document.body.innerText.trim().length >= {min_chars}",
+                timeout=15_000
+            )
+        except PlaywrightTimeout:
+            log.debug("scrape.text_length_timeout", url=url, attempt=attempt)
+
         try:
             await page.wait_for_load_state("networkidle", timeout=15_000)
         except PlaywrightTimeout:
